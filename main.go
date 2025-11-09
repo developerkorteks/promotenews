@@ -33,7 +33,7 @@ func main() {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = "9724"
 	}
 	log.Println("HTTP listening on :" + port)
 	if err := http.ListenAndServe(":"+port, router); err != nil {
