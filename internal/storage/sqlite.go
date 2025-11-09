@@ -108,9 +108,23 @@ func migrate(db *sql.DB) error {
 			FOREIGN KEY(group_id) REFERENCES groups(id) ON DELETE SET NULL,
 			FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE SET NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS templates (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			text TEXT,
+			images_json TEXT,
+			videos_json TEXT,
+			stickers_json TEXT,
+			docs_json TEXT,
+			audio_json TEXT,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
 		`CREATE INDEX IF NOT EXISTS idx_groups_account ON groups(account_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_campaign_ts ON logs(campaign_id, ts);`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_group_ts ON logs(group_id, ts);`,
+		`CREATE INDEX IF NOT EXISTS idx_templates_enabled ON templates(enabled);`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(s); err != nil {
@@ -118,6 +132,8 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	// Best-effort schema upgrade for existing installations: add audio_json if missing.
+	_, _ = tx.Exec(`ALTER TABLE templates ADD COLUMN audio_json TEXT;`)
 	return tx.Commit()
 }
 
@@ -245,4 +261,22 @@ func btoi(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// UpdateAccount memperbarui label, msisdn, enabled, dan daily_limit sebuah akun.
+func (s *Store) UpdateAccount(id, label, msisdn string, enabled bool, dailyLimit int) error {
+	if dailyLimit <= 0 {
+		dailyLimit = 100
+	}
+	_, err := s.DB.Exec(`UPDATE accounts 
+		SET label=?, msisdn=?, enabled=?, daily_limit=?, updated_at=CURRENT_TIMESTAMP 
+		WHERE id=?`,
+		label, msisdn, btoi(enabled), dailyLimit, id)
+	return err
+}
+
+// DeleteAccount menghapus akun. Relasi groups akan ikut terhapus karena ON DELETE CASCADE.
+func (s *Store) DeleteAccount(id string) error {
+	_, err := s.DB.Exec(`DELETE FROM accounts WHERE id=?`, id)
+	return err
 }

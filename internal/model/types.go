@@ -38,15 +38,17 @@ type Group struct {
 
 // Campaign defines flexible promotional content (text + media).
 type Campaign struct {
-	ID               string    `json:"id" db:"id"`
-	Name             string    `json:"name" db:"name"`
-	Text             string    `json:"text" db:"text"`
-	MediaImagesJSON  string    `json:"media_images_json" db:"media_images"`
-	MediaVideosJSON  string    `json:"media_videos_json" db:"media_videos"`
-	Enabled          bool      `json:"enabled" db:"enabled"`
-	PerGroupVariants int       `json:"per_group_variants" db:"per_group_variants"`
-	CreatedAt        time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at" db:"updated_at"`
+	ID                string    `json:"id" db:"id"`
+	Name              string    `json:"name" db:"name"`
+	Text              string    `json:"text" db:"text"`
+	MediaImagesJSON   string    `json:"media_images_json" db:"media_images"`
+	MediaVideosJSON   string    `json:"media_videos_json" db:"media_videos"`
+	MediaStickersJSON string    `json:"media_stickers_json" db:"media_stickers"`
+	MediaDocsJSON     string    `json:"media_docs_json" db:"media_docs"`
+	Enabled           bool      `json:"enabled" db:"enabled"`
+	PerGroupVariants  int       `json:"per_group_variants" db:"per_group_variants"`
+	CreatedAt         time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // Schedule configures anti-spam safe scheduling for a campaign/account.

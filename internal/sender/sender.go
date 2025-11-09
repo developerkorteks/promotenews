@@ -3,11 +3,13 @@ package sender
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -20,9 +22,12 @@ import (
 )
 
 type MessageContent struct {
-	Text      string   `json:"text"`
-	ImageURLs []string `json:"image_urls"`
-	VideoURLs []string `json:"video_urls"`
+	Text        string   `json:"text"`
+	ImageURLs   []string `json:"image_urls"`
+	VideoURLs   []string `json:"video_urls"`
+	AudioURLs   []string `json:"audio_urls"`
+	StickerURLs []string `json:"sticker_urls"`
+	DocURLs     []string `json:"doc_urls"`
 }
 
 type Sender struct {
@@ -210,6 +215,60 @@ func (s *Sender) SendToGroup(ctx context.Context, accountID, groupJID string, co
 		}
 	}
 
+	// 4) Send audios (with retry/backoff per media)
+	for idx, u := range content.AudioURLs {
+		err := withRetry(ctx, func() error {
+			return s.sendAudioByURL(ctx, cli, jid, u)
+		})
+		if err != nil {
+			_ = s.logResult(accountID, groupJID, "", "failed", "audio:"+u, err.Error(), idx+1, time.Now())
+			s.bumpRiskAndMaybePause(groupJID)
+			log.Printf("[sender] audio failed account=%s group=%s url=%s err=%v", accountID, groupJID, u, err)
+			return err
+		}
+		_ = s.logResult(accountID, groupJID, "", "sent", "audio:"+u, "", idx+1, time.Now())
+		// pacing
+		if err := sleepRange(ctx, 1200*time.Millisecond, 2500*time.Millisecond); err != nil {
+			return err
+		}
+	}
+
+	// 5) Send stickers (with retry/backoff per media)
+	for idx, u := range content.StickerURLs {
+		err := withRetry(ctx, func() error {
+			return s.sendStickerByURL(ctx, cli, jid, u)
+		})
+		if err != nil {
+			_ = s.logResult(accountID, groupJID, "", "failed", "sticker:"+u, err.Error(), idx+1, time.Now())
+			s.bumpRiskAndMaybePause(groupJID)
+			log.Printf("[sender] sticker failed account=%s group=%s url=%s err=%v", accountID, groupJID, u, err)
+			return err
+		}
+		_ = s.logResult(accountID, groupJID, "", "sent", "sticker:"+u, "", idx+1, time.Now())
+		// pacing
+		if err := sleepRange(ctx, 1200*time.Millisecond, 2500*time.Millisecond); err != nil {
+			return err
+		}
+	}
+
+	// 6) Send documents (with retry/backoff per media)
+	for idx, u := range content.DocURLs {
+		caption := personalize(content.Text, groupName)
+		err := withRetry(ctx, func() error {
+			return s.sendDocumentByURL(ctx, cli, jid, u, caption)
+		})
+		if err != nil {
+			_ = s.logResult(accountID, groupJID, "", "failed", "doc:"+u, err.Error(), idx+1, time.Now())
+			s.bumpRiskAndMaybePause(groupJID)
+			log.Printf("[sender] document failed account=%s group=%s url=%s err=%v", accountID, groupJID, u, err)
+			return err
+		}
+		_ = s.logResult(accountID, groupJID, "", "sent", "doc:"+u, "", idx+1, time.Now())
+		if err := sleepRange(ctx, 1500*time.Millisecond, 3000*time.Millisecond); err != nil {
+			return err
+		}
+	}
+
 	// update last_sent_at for cadence enforcement
 	_, _ = s.Store.DB.Exec(`UPDATE groups SET last_sent_at=CURRENT_TIMESTAMP WHERE id=?`, groupJID)
 	return nil
@@ -271,7 +330,139 @@ func (s *Sender) sendVideoByURL(ctx context.Context, c *whatsmeow.Client, jid ty
 	return err
 }
 
+func (s *Sender) sendAudioByURL(ctx context.Context, c *whatsmeow.Client, jid types.JID, url string) error {
+	data, mime, err := s.fetch(ctx, url)
+	if err != nil {
+		return err
+	}
+	up, err := c.Upload(ctx, data, whatsmeow.MediaAudio)
+	if err != nil {
+		return fmt.Errorf("upload audio: %w", err)
+	}
+	length := uint64(len(data))
+	am := &proto.AudioMessage{
+		Mimetype:      optstr(mime),
+		URL:           optstr(up.URL),
+		DirectPath:    optstr(up.DirectPath),
+		MediaKey:      up.MediaKey,
+		FileEncSHA256: up.FileEncSHA256,
+		FileSHA256:    up.FileSHA256,
+		FileLength:    &length,
+		// Ptt: proto.Bool(true), // uncomment if you want voice note style
+	}
+	msg := &proto.Message{AudioMessage: am}
+	_, err = c.SendMessage(ctx, jid, msg)
+	return err
+}
+
+func (s *Sender) sendStickerByURL(ctx context.Context, c *whatsmeow.Client, jid types.JID, url string) error {
+	data, mime, err := s.fetch(ctx, url)
+	if err != nil {
+		return err
+	}
+	up, err := c.Upload(ctx, data, whatsmeow.MediaImage)
+	if err != nil {
+		return fmt.Errorf("upload sticker: %w", err)
+	}
+	length := uint64(len(data))
+	st := &proto.StickerMessage{
+		Mimetype:      optstr(mime),
+		URL:           optstr(up.URL),
+		DirectPath:    optstr(up.DirectPath),
+		MediaKey:      up.MediaKey,
+		FileEncSHA256: up.FileEncSHA256,
+		FileSHA256:    up.FileSHA256,
+		FileLength:    &length,
+	}
+	msg := &proto.Message{StickerMessage: st}
+	_, err = c.SendMessage(ctx, jid, msg)
+	return err
+}
+
+func (s *Sender) sendDocumentByURL(ctx context.Context, c *whatsmeow.Client, jid types.JID, url, caption string) error {
+	data, mime, err := s.fetch(ctx, url)
+	if err != nil {
+		return err
+	}
+	up, err := c.Upload(ctx, data, whatsmeow.MediaDocument)
+	if err != nil {
+		return fmt.Errorf("upload document: %w", err)
+	}
+	length := uint64(len(data))
+	fname := fileNameFromURL(url)
+	doc := &proto.DocumentMessage{
+		Caption:       optstr(caption),
+		Mimetype:      optstr(mime),
+		FileName:      optstr(fname),
+		URL:           optstr(up.URL),
+		DirectPath:    optstr(up.DirectPath),
+		MediaKey:      up.MediaKey,
+		FileEncSHA256: up.FileEncSHA256,
+		FileSHA256:    up.FileSHA256,
+		FileLength:    &length,
+	}
+	msg := &proto.Message{DocumentMessage: doc}
+	_, err = c.SendMessage(ctx, jid, msg)
+	return err
+}
+
+func fileNameFromURL(u string) string {
+	s := u
+	if i := strings.Index(s, "?"); i >= 0 {
+		s = s[:i]
+	}
+	if j := strings.LastIndex(s, "/"); j >= 0 && j < len(s)-1 {
+		return s[j+1:]
+	}
+	return "file"
+}
+
 func (s *Sender) fetch(ctx context.Context, url string) ([]byte, string, error) {
+	// Handle local uploads served by our app: "/uploads/..." or "uploads/..."
+	if strings.HasPrefix(url, "/uploads/") || strings.HasPrefix(url, "uploads/") {
+		path := url
+		// normalize leading slash
+		if strings.HasPrefix(path, "/") {
+			path = path[1:]
+		}
+		// security: must stay under uploads/
+		if !strings.HasPrefix(path, "uploads/") {
+			return nil, "", fmt.Errorf("invalid local upload path")
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, "", err
+		}
+		defer f.Close()
+		body, err := io.ReadAll(f)
+		if err != nil {
+			return nil, "", err
+		}
+		// derive content-type based on file extension as a fallback
+		lower := strings.ToLower(path)
+		ct := "application/octet-stream"
+		switch {
+		case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
+			ct = "image/jpeg"
+		case strings.HasSuffix(lower, ".png"):
+			ct = "image/png"
+		case strings.HasSuffix(lower, ".webp"):
+			ct = "image/webp"
+		case strings.HasSuffix(lower, ".mp4"):
+			ct = "video/mp4"
+		case strings.HasSuffix(lower, ".mp3"):
+			ct = "audio/mpeg"
+		case strings.HasSuffix(lower, ".ogg"):
+			ct = "audio/ogg"
+		case strings.HasSuffix(lower, ".wav"):
+			ct = "audio/wav"
+		case strings.HasSuffix(lower, ".m4a"):
+			ct = "audio/m4a"
+		}
+		return body, ct, nil
+	}
+
+	// Remote URLs: fetch via HTTP client
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, "", err
@@ -292,14 +483,26 @@ func (s *Sender) fetch(ctx context.Context, url string) ([]byte, string, error) 
 	}
 	ct := res.Header.Get("Content-Type")
 	if ct == "" {
-		// naive fallback
-		if strings.Contains(strings.ToLower(url), ".jpg") || strings.Contains(strings.ToLower(url), ".jpeg") {
+		// naive fallback using URL extension
+		lower := strings.ToLower(url)
+		switch {
+		case strings.Contains(lower, ".jpg"), strings.Contains(lower, ".jpeg"):
 			ct = "image/jpeg"
-		} else if strings.Contains(strings.ToLower(url), ".png") {
+		case strings.Contains(lower, ".png"):
 			ct = "image/png"
-		} else if strings.Contains(strings.ToLower(url), ".mp4") {
+		case strings.Contains(lower, ".webp"):
+			ct = "image/webp"
+		case strings.Contains(lower, ".mp4"):
 			ct = "video/mp4"
-		} else {
+		case strings.Contains(lower, ".mp3"):
+			ct = "audio/mpeg"
+		case strings.Contains(lower, ".ogg"):
+			ct = "audio/ogg"
+		case strings.Contains(lower, ".wav"):
+			ct = "audio/wav"
+		case strings.Contains(lower, ".m4a"):
+			ct = "audio/m4a"
+		default:
 			ct = "application/octet-stream"
 		}
 	}
@@ -326,7 +529,19 @@ func personalize(text, groupName string) string {
 	if text == "" {
 		return text
 	}
-	return strings.ReplaceAll(text, "{group_name}", groupName)
+	// Personalisasi waktu lokal Asia/Jakarta (WIB) untuk placeholder {time_now}
+	loc, err := time.LoadLocation("Asia/Jakarta")
+	now := time.Now()
+	if err == nil && loc != nil {
+		now = now.In(loc)
+	}
+	timeNow := now.Format("15:04") // contoh: "08:39"
+
+	r := strings.NewReplacer(
+		"{group_name}", groupName,
+		"{time_now}", timeNow,
+	)
+	return r.Replace(text)
 }
 
 func short(s string) string {
@@ -349,4 +564,50 @@ func nullIfEmpty(s string) any {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: s, Valid: true}
+}
+
+// Build MessageContent from a random enabled template (DB-level rotation).
+func (s *Sender) RandomTemplateContent(ctx context.Context) (MessageContent, error) {
+	var text, imgJSON, vidJSON, stJSON, docJSON string
+	err := s.Store.DB.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(text,''),
+			COALESCE(images_json,''),
+			COALESCE(videos_json,''),
+			COALESCE(stickers_json,''),
+			COALESCE(docs_json,'')
+		FROM templates
+		WHERE enabled=1
+		ORDER BY RANDOM()
+		LIMIT 1
+	`).Scan(&text, &imgJSON, &vidJSON, &stJSON, &docJSON)
+	if err != nil {
+		return MessageContent{}, err
+	}
+	content := MessageContent{
+		Text:        text,
+		ImageURLs:   parseJSONArr(imgJSON),
+		VideoURLs:   parseJSONArr(vidJSON),
+		StickerURLs: parseJSONArr(stJSON),
+		DocURLs:     parseJSONArr(docJSON),
+	}
+	return content, nil
+}
+
+// Convenience wrapper to send using a random active template.
+func (s *Sender) SendToGroupUsingRandomTemplate(ctx context.Context, accountID, groupJID string) error {
+	content, err := s.RandomTemplateContent(ctx)
+	if err != nil {
+		return fmt.Errorf("no active template or query failed: %w", err)
+	}
+	return s.SendToGroup(ctx, accountID, groupJID, content)
+}
+
+func parseJSONArr(s string) []string {
+	var arr []string
+	if strings.TrimSpace(s) == "" {
+		return arr
+	}
+	_ = json.Unmarshal([]byte(s), &arr)
+	return arr
 }

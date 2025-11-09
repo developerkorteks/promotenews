@@ -7,6 +7,8 @@ import (
 	"os"
 
 	httpapi "promote/internal/http"
+	"promote/internal/scheduler"
+	"promote/internal/sender"
 	"promote/internal/storage"
 	"promote/internal/wa"
 )
@@ -28,6 +30,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// Inisialisasi pengirim dan scheduler anti-spam (aktif otomatis dengan jendela aman WIB).
+	snd := sender.New(store, manager)
+	sched := scheduler.New(store, manager, snd)
+	sched.Start(ctx)
 
 	router := httpapi.NewRouter(store, manager)
 

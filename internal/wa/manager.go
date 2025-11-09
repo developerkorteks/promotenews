@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,9 +29,21 @@ type Manager struct {
 	ClientLogger  waLog.Logger
 	pairingMu     sync.Mutex
 	pairingActive map[string]bool
+
+	// Multi-session isolation: satu sqlstore container per account
+	BaseDSN    string
+	Containers map[string]*sqlstore.Container
 }
 
 var ErrPairingByNumberUnsupported = errors.New("pairing via phone number unsupported by current whatsmeow")
+
+// ParticipantInfo merepresentasikan anggota grup (user) beserta atribut admin.
+type ParticipantInfo struct {
+	JID          string `json:"jid"`
+	Number       string `json:"number"`
+	IsAdmin      bool   `json:"is_admin"`
+	IsSuperAdmin bool   `json:"is_superadmin"`
+}
 
 func NewManager(ctx context.Context, dsn string, store *storage.Store) (*Manager, error) {
 	dbLog := waLog.Stdout("Database", "INFO", true)
@@ -48,14 +61,71 @@ func NewManager(ctx context.Context, dsn string, store *storage.Store) (*Manager
 		DBLogger:      dbLog,
 		ClientLogger:  clientLog,
 		pairingActive: make(map[string]bool),
+		BaseDSN:       dsn,
+		Containers:    make(map[string]*sqlstore.Container),
 	}, nil
+}
+
+// perAccountDSN menghasilkan DSN SQLite terpisah per akun untuk mengisolasi sesi device whatsmeow.
+func (m *Manager) perAccountDSN(accountID string) string {
+	base := m.BaseDSN
+	if base == "" {
+		return fmt.Sprintf("file:promote_wa_%s.db?_foreign_keys=on", accountID)
+	}
+	// Pisahkan query string jika ada
+	var path, q string
+	if i := strings.Index(base, "?"); i >= 0 {
+		path = base[:i]
+		q = base[i+1:]
+	} else {
+		path = base
+	}
+	if strings.HasPrefix(path, "file:") {
+		fn := strings.TrimPrefix(path, "file:")
+		lfn := strings.ToLower(fn)
+		if strings.HasSuffix(lfn, ".db") {
+			fn = strings.TrimSuffix(fn, ".db") + "_wa_" + accountID + ".db"
+		} else {
+			fn = fn + "_wa_" + accountID + ".db"
+		}
+		dsn := "file:" + fn
+		if q != "" {
+			dsn = dsn + "?" + q
+		}
+		return dsn
+	}
+	// Fallback: append parameter pembeda
+	if q != "" {
+		return fmt.Sprintf("%s&acc=%s", base, accountID)
+	}
+	return fmt.Sprintf("%s?acc=%s", base, accountID)
 }
 
 func (m *Manager) ensureClient(accountID string) (*whatsmeow.Client, error) {
 	if c, ok := m.Clients[accountID]; ok {
 		return c, nil
 	}
-	device := m.Container.NewDevice()
+
+	// Pastikan ada container sqlstore terpisah per akun (persisten dan terisolasi)
+	cont := m.Containers[accountID]
+	if cont == nil {
+		dsn := m.perAccountDSN(accountID)
+		var err error
+		cont, err = sqlstore.New(context.Background(), "sqlite3", dsn, m.DBLogger)
+		if err != nil {
+			return nil, err
+		}
+		m.Containers[accountID] = cont
+	}
+
+	// Reuse device yang sudah ada di store akun ini jika tersedia, kalau tidak buat baru
+	device, err := cont.GetFirstDevice(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if device == nil {
+		device = cont.NewDevice()
+	}
 	client := whatsmeow.NewClient(device, m.ClientLogger)
 
 	// Update account status according to events
@@ -197,9 +267,45 @@ func (m *Manager) RequestPairingCode(ctx context.Context, accountID, msisdn stri
 	return code, nil
 }
 
-// GetClient returns (or creates) a whatsmeow client for an account without connecting.
+/*
+GetClient returns (or creates) a whatsmeow client for an account without connecting.
+*/
 func (m *Manager) GetClient(accountID string) (*whatsmeow.Client, error) {
 	return m.ensureClient(accountID)
+}
+
+// Logout disconnects and logs out the account device session.
+func (m *Manager) Logout(accountID string) error {
+	c, err := m.ensureClient(accountID)
+	if err != nil {
+		return err
+	}
+	// Putuskan koneksi websocket terlebih dahulu.
+	c.Disconnect()
+	// Coba logout server-side; beberapa versi bisa gagal jika sudah logout.
+	if err := c.Logout(context.Background()); err != nil {
+		m.ClientLogger.Errorf("logout: account=%s err=%v", accountID, err)
+	}
+	_ = m.Store.UpdateAccountStatus(accountID, "logged_out", "", nil)
+	return nil
+}
+
+// DropAccount disconnects client and removes it from manager cache.
+func (m *Manager) DropAccount(accountID string) {
+	if c, ok := m.Clients[accountID]; ok && c != nil {
+		c.Disconnect()
+		delete(m.Clients, accountID)
+	}
+}
+
+// lookupMSISDN returns the msisdn stored for an account (if any).
+func (m *Manager) lookupMSISDN(accountID string) string {
+	var ms sql.NullString
+	_ = m.DB.QueryRow(`SELECT msisdn FROM accounts WHERE id=?`, accountID).Scan(&ms)
+	if ms.Valid {
+		return ms.String
+	}
+	return ""
 }
 
 // SendText sends a plain text message to a group JID string like "12345-67890@g.us".
@@ -235,12 +341,35 @@ func (m *Manager) FetchAndSyncGroups(ctx context.Context, accountID string) (int
 		return 0, fmt.Errorf("not paired")
 	}
 
-	// whatsmeow currently provides GetJoinedGroups(ctx) which returns a map keyed by JID.
-	// We only need group ID (string) and name/subject for display.
+	// Ensure the client is connected before fetching groups.
+	if err := client.Connect(); err != nil {
+		// tolerate "already connected" errors
+		if !strings.Contains(strings.ToLower(err.Error()), "already") {
+			return 0, err
+		}
+	}
+
+	// Brief settle time for session
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+
+	// Get joined groups, retry once if it fails (e.g., right after connect)
 	gmap, err := client.GetJoinedGroups(ctx)
 	if err != nil {
-		return 0, err
+		select {
+		case <-time.After(800 * time.Millisecond):
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+		gmap, err = client.GetJoinedGroups(ctx)
+		if err != nil {
+			return 0, err
+		}
 	}
+
 	count := 0
 	for _, info := range gmap {
 		name := info.Name
@@ -254,4 +383,46 @@ func (m *Manager) FetchAndSyncGroups(ctx context.Context, accountID string) (int
 		count++
 	}
 	return count, nil
+}
+
+// GetGroupParticipants mengambil daftar anggota (user) pada sebuah grup untuk akun tertentu.
+// Mengembalikan slice berisi JID, nomor (user), dan flag admin.
+func (m *Manager) GetGroupParticipants(ctx context.Context, accountID, groupJID string) ([]ParticipantInfo, error) {
+	client, err := m.ensureClient(accountID)
+	if err != nil {
+		return nil, err
+	}
+	if client.Store == nil || client.Store.ID == nil {
+		return nil, fmt.Errorf("not paired")
+	}
+
+	jid, err := types.ParseJID(groupJID)
+	if err != nil {
+		return nil, fmt.Errorf("parse JID: %w", err)
+	}
+
+	// Pastikan terkoneksi; toleransi error "already connected"
+	if err := client.Connect(); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "already") {
+			return nil, err
+		}
+	}
+
+	// Ambil info grup dari WhatsApp
+	ctx2, cancel := context.WithTimeout(ctx, 85*time.Second)
+	defer cancel()
+	info, err := client.GetGroupInfo(ctx2, jid)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ParticipantInfo, 0, len(info.Participants))
+	for _, p := range info.Participants {
+		out = append(out, ParticipantInfo{
+			JID:          p.JID.String(),
+			Number:       p.JID.User,
+			IsAdmin:      p.IsAdmin,
+			IsSuperAdmin: p.IsSuperAdmin,
+		})
+	}
+	return out, nil
 }
