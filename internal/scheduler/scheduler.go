@@ -5,6 +5,9 @@ import (
 	"database/sql"
 	"log"
 	"math/rand"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"promote/internal/sender"
@@ -36,12 +39,20 @@ type Scheduler struct {
 	maxDelaySec int
 	// Risk threshold untuk filter grup
 	riskThreshold int
+	// Override agar inWindow selalu true (uji/ops): SCHEDULER_ALWAYS_ON=1|true|yes
+	alwaysOn bool
 }
 
 // New membuat instance Scheduler dengan konfigurasi default konservatif.
 func New(store *storage.Store, manager *wa.Manager, snd *sender.Sender) *Scheduler {
-	loc, _ := time.LoadLocation("Asia/Jakarta")
-	return &Scheduler{
+	// Pastikan zona waktu WIB tersedia. Jika tzdata tidak terpasang di VPS,
+	// time.LoadLocation("Asia/Jakarta") bisa gagal. Fallback ke zona tetap +07:00.
+	loc, err := time.LoadLocation("Asia/Jakarta")
+	if err != nil || loc == nil {
+		loc = time.FixedZone("WIB", 7*3600)
+	}
+
+	s := &Scheduler{
 		Store:         store,
 		Manager:       manager,
 		Sender:        snd,
@@ -52,7 +63,43 @@ func New(store *storage.Store, manager *wa.Manager, snd *sender.Sender) *Schedul
 		minDelaySec:   45,
 		maxDelaySec:   120,
 		riskThreshold: 3,
+		alwaysOn:      false,
 	}
+
+	// ENV overrides (ops):
+	// - SCHEDULER_ALWAYS_ON=1|true|yes  -> jalankan kapan saja (abaikan window)
+	// - SCHEDULER_COOLDOWN_HOURS=int    -> override cooldown antar kirim ke grup yang sama
+	// - SCHEDULER_MIN_DELAY_SEC=int     -> delay min antar grup
+	// - SCHEDULER_MAX_DELAY_SEC=int     -> delay max antar grup
+	// - SCHEDULER_RISK_THRESHOLD=int    -> ambang risk_score untuk filter/auto-disable
+	if v := os.Getenv("SCHEDULER_ALWAYS_ON"); v != "" {
+		vv := strings.ToLower(strings.TrimSpace(v))
+		if vv == "1" || vv == "true" || vv == "yes" {
+			s.alwaysOn = true
+		}
+	}
+	if v := os.Getenv("SCHEDULER_COOLDOWN_HOURS"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			s.cooldownHr = n
+		}
+	}
+	if v := os.Getenv("SCHEDULER_MIN_DELAY_SEC"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			s.minDelaySec = n
+		}
+	}
+	if v := os.Getenv("SCHEDULER_MAX_DELAY_SEC"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			s.maxDelaySec = n
+		}
+	}
+	if v := os.Getenv("SCHEDULER_RISK_THRESHOLD"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			s.riskThreshold = n
+		}
+	}
+
+	return s
 }
 
 // Start menjalankan loop scheduler di goroutine.
@@ -62,6 +109,17 @@ func (s *Scheduler) Start(ctx context.Context) {
 		return
 	}
 	s.running = true
+	// Log awal untuk diagnosis: pastikan timezone & jendela waktu terbaca benar
+	log.Printf("[scheduler] start: tz=%s now=%s windows=%v alwaysOn=%v cooldownHr=%d minDelay=%ds maxDelay=%ds riskThreshold=%d",
+		s.loc.String(),
+		time.Now().In(s.loc).Format(time.RFC3339),
+		s.windows,
+		s.alwaysOn,
+		s.cooldownHr,
+		s.minDelaySec,
+		s.maxDelaySec,
+		s.riskThreshold,
+	)
 	go s.loop(ctx)
 }
 
@@ -91,8 +149,21 @@ func (s *Scheduler) loop(ctx context.Context) {
 		case <-tick.C:
 			// Jalankan satu siklus jika dalam jendela waktu aman
 			now := time.Now().In(s.loc)
-			if !s.inWindow(now) {
-				continue
+			inWindow := s.inWindow(now)
+			if !inWindow {
+				ns, ne, dur := s.nextWindow(now)
+				log.Printf("[scheduler] tick: now=%s in_window=%v next_window=%02d:%02d-%02d:%02d in=%s alwaysOn=%v",
+					now.Format("2006-01-02 15:04:05"),
+					inWindow,
+					ns/60, ns%60, ne/60, ne%60,
+					dur.String(),
+					s.alwaysOn,
+				)
+				if !s.alwaysOn {
+					continue
+				}
+			} else {
+				log.Printf("[scheduler] tick: now=%s in_window=%v alwaysOn=%v", now.Format("2006-01-02 15:04:05"), inWindow, s.alwaysOn)
 			}
 			// Proses: satu kirim maksimum setiap siklus (menghindari burst)
 			if err := s.processOneSend(ctx, now); err != nil {
@@ -112,6 +183,7 @@ func (s *Scheduler) processOneSend(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	log.Printf("[scheduler] accounts_enabled=%d", len(accs))
 	if len(accs) == 0 {
 		return nil
 	}
@@ -123,11 +195,13 @@ func (s *Scheduler) processOneSend(ctx context.Context, now time.Time) error {
 		// Pastikan akun paired & siap connect (best-effort)
 		if err := s.Manager.ConnectIfPaired(a.ID); err != nil {
 			// skip akun yang belum paired
+			log.Printf("[scheduler] account=%s connectIfPaired=skip err=%v", a.ID, err)
 			continue
 		}
 		// 2) Cek limit harian akun (sent hari ini)
 		sentToday, err := s.countSentTodayForAccount(a.ID)
 		if err != nil {
+			log.Printf("[scheduler] account=%s sentToday-query-err=%v", a.ID, err)
 			continue
 		}
 		if a.DailyLimit <= 0 {
@@ -135,28 +209,45 @@ func (s *Scheduler) processOneSend(ctx context.Context, now time.Time) error {
 		}
 		if int(sentToday) >= a.DailyLimit {
 			// limit tercapai; lanjut akun lain
+			log.Printf("[scheduler] account=%s sentToday=%d dailyLimit=%d -> skip (limit reached)", a.ID, sentToday, a.DailyLimit)
 			continue
 		}
+
+		// Logging eligible groups count
+		eligibleCnt, err := s.countEligibleGroups(a.ID, s.cooldownHr, s.riskThreshold)
+		if err != nil {
+			log.Printf("[scheduler] account=%s eligible-count-err=%v", a.ID, err)
+		} else {
+			log.Printf("[scheduler] account=%s eligible_groups=%d", a.ID, eligibleCnt)
+		}
+
 		// 3) Pilih grup satu yang eligible untuk dikirim sekarang
 		groupID, err := s.pickOneEligibleGroup(a.ID, s.cooldownHr, s.riskThreshold)
 		if err != nil {
+			log.Printf("[scheduler] account=%s pick-group-err=%v", a.ID, err)
 			continue
 		}
 		if groupID == "" {
 			// tidak ada grup eligible di akun ini saat ini, lanjut akun lain
+			log.Printf("[scheduler] account=%s pick-group=none", a.ID)
 			continue
 		}
+		log.Printf("[scheduler] account=%s group=%s -> sending with random template...", a.ID, groupID)
+
 		// 4) Kirim menggunakan template acak (sender sudah tangani pacing antar bagian)
 		sendCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 		err = s.Sender.SendToGroupUsingRandomTemplate(sendCtx, a.ID, groupID)
 		cancel()
 		// Jika gagal, sender akan bump risk dan mungkin auto-disable grup
 		if err != nil {
+			log.Printf("[scheduler] send failed account=%s group=%s err=%v", a.ID, groupID, err)
 			// Setelah gagal, tetap jeda sebentar untuk naturalness
 			s.sleepBetweenGroups(ctx)
 			// lanjut akun lain setelah jeda
 			continue
 		}
+		log.Printf("[scheduler] send success account=%s group=%s", a.ID, groupID)
+
 		// 5) Jeda antar grup (jitter 45–120 detik)
 		s.sleepBetweenGroups(ctx)
 		// Satu kirim per siklus; keluar supaya tidak burst
@@ -185,6 +276,10 @@ func (s *Scheduler) randDelay() time.Duration {
 }
 
 func (s *Scheduler) inWindow(t time.Time) bool {
+	// Ops override: jalankan kapan saja jika diaktifkan
+	if s.alwaysOn {
+		return true
+	}
 	// menit dari tengah malam (WIB)
 	m := t.Hour()*60 + t.Minute()
 	for _, w := range s.windows {
@@ -193,6 +288,35 @@ func (s *Scheduler) inWindow(t time.Time) bool {
 		}
 	}
 	return false
+}
+
+// nextWindow mengembalikan pasangan [startMin,endMin] untuk window berikutnya
+// relatif terhadap waktu t (WIB) dan durasi menuju start window tersebut.
+func (s *Scheduler) nextWindow(t time.Time) (startMin int, endMin int, until time.Duration) {
+	m := t.Hour()*60 + t.Minute()
+	var nextStart, nextEnd int
+	found := false
+	for _, w := range s.windows {
+		if m <= w[0] {
+			nextStart = w[0]
+			nextEnd = w[1]
+			found = true
+			break
+		}
+	}
+	if !found {
+		// gunakan window pertama pada hari berikutnya
+		nextStart = s.windows[0][0]
+		nextEnd = s.windows[0][1]
+	}
+	// hitung durasi menuju nextStart
+	// konversi menit dari tengah malam ke time.Time untuk hari ini/tomorrow
+	dayStart := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, s.loc)
+	nextStartTime := dayStart.Add(time.Duration(nextStart) * time.Minute)
+	if nextStartTime.Before(t) {
+		nextStartTime = nextStartTime.Add(24 * time.Hour)
+	}
+	return nextStart, nextEnd, nextStartTime.Sub(t)
 }
 
 type accountLite struct {
@@ -224,6 +348,19 @@ func (s *Scheduler) countSentTodayForAccount(accountID string) (int64, error) {
 		FROM logs
 		WHERE account_id=? AND ts >= datetime('now','start of day') AND ts < datetime('now','start of day','+1 day')
 	`, accountID).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func (s *Scheduler) countEligibleGroups(accountID string, cooldownHours int, riskThreshold int) (int64, error) {
+	var n int64
+	err := s.Store.DB.QueryRow(`
+		SELECT COUNT(*)
+		FROM groups
+		WHERE account_id=? AND enabled=1 AND (last_sent_at IS NULL OR last_sent_at < datetime('now', ?)) AND risk_score < ?
+	`, accountID, "-"+itoa(cooldownHours)+" hours", riskThreshold).Scan(&n)
 	if err != nil {
 		return 0, err
 	}

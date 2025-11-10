@@ -1,0 +1,10 @@
+2025/11/10 21:31:45 [scheduler] start: tz=Asia/Jakarta now=2025-11-10T21:31:45+07:00 windows=[[45 150] [180 330] [1290 1410]] alwaysOn=true cooldownHr=48 minDelay=45s maxDelay=120s riskThreshold=3
+2025/11/10 21:31:45 HTTP listening on :9724
+2025/11/10 21:31:46 [fedora/UjSJlE6De8-000001] "GET http://localhost:9724/api/health HTTP/1.1" from [::1]:38116 - 200 47B in 69.454µs
+2025/11/10 21:31:46 [fedora/UjSJlE6De8-000002] "GET http://localhost:9724/api/health HTTP/1.1" from [::1]:38118 - 200 47B in 44.633µs
+2025/11/10 21:31:47 [fedora/UjSJlE6De8-000004] "GET http://localhost:9724/api/health HTTP/1.1" from [::1]:38124 - 200 47B in 49.492µs
+2025/11/10 21:31:47 [fedora/UjSJlE6De8-000005] "GET http://localhost:9724/api/stats HTTP/1.1" from [::1]:38134 - 200 35B in 502.989µs
+2025/11/10 21:31:57 [fedora/UjSJlE6De8-000006] "GET http://localhost:9724/api/health HTTP/1.1" from [::1]:46180 - 200 47B in 48.106µs
+2025/11/10 21:32:02 [fedora/UjSJlE6De8-000007] "GET http://localhost:9724/api/stats HTTP/1.1" from [::1]:46180 - 200 35B in 136.796µs
+2025/11/10 21:32:07 [fedora/UjSJlE6De8-000008] "GET http://localhost:9724/api/health HTTP/1.1" from [::1]:46180 - 200 47B in 27.243µs
+signal: killed

@@ -56,9 +56,15 @@ func (a *API) routes() {
 	a.Router.Post("/api/accounts", a.handleCreateAccount)
 	a.Router.Put("/api/accounts/{id}", a.handleUpdateAccount)
 	a.Router.Delete("/api/accounts/{id}", a.handleDeleteAccount)
+	a.Router.Post("/api/accounts/{id}/force_delete", a.handleForceDeleteAccount)
+	// Accounts ops helpers
+	a.Router.Get("/api/accounts/search", a.handleSearchAccounts)
+	a.Router.Post("/api/accounts/delete_by_msisdn", a.handleDeleteByMSISDN)
+
 	a.Router.Get("/api/groups", a.handleListGroups)
 	a.Router.Post("/api/groups/toggle", a.handleToggleGroup)
 	a.Router.Get("/api/stats", a.handleStats)
+	a.Router.Get("/api/diag", a.handleDiag)
 
 	// Templates management
 	a.Router.Get("/api/templates", a.handleListTemplates)
@@ -78,12 +84,20 @@ func (a *API) routes() {
 	// Refresh groups from WhatsApp
 	a.Router.Post("/api/accounts/{id}/groups/refresh", a.handleRefreshGroups)
 
+	// Bulk enable groups for an account (ops helper)
+	a.Router.Post("/api/accounts/{id}/groups/enable_all", a.handleEnableAllGroups)
+	// Ops: reset risiko + cooldown untuk percepat eligibility troubleshooting
+	a.Router.Post("/api/accounts/{id}/groups/reset_risk_cooldown", a.handleResetRiskCooldown)
+
 	// Group participants & CSV export
 	a.Router.Get("/api/accounts/{id}/groups/{gid}/participants", a.handleGroupParticipants)
 	a.Router.Get("/api/accounts/{id}/groups/{gid}/participants.csv", a.handleGroupParticipantsCSV)
 
 	// Send test (manual trigger) endpoint
 	a.Router.Post("/api/send/test", a.handleSendTest)
+
+	// Force one-off scheduler send (ignore safe window) for diagnostics
+	a.Router.Post("/api/scheduler/trigger", a.handleSchedulerTrigger)
 
 	// Log streaming (SSE)
 	a.Router.Get("/api/logs/stream", a.handleLogsStream)
@@ -199,14 +213,20 @@ func (a *API) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if !exists {
-		writeErr(w, http.StatusNotFound, "account not found")
-		return
+	// Best-effort: selalu coba logout & drop client agar sesi tidak menggantung,
+	// meskipun akun tidak ada di database atau belum pernah paired.
+	if err := a.Manager.Logout(id); err != nil {
+		log.Printf("delete: logout best-effort for %s: %v", id, err)
 	}
-	// Best-effort: logout & drop client cache untuk mencegah sesi menggantung/terdeteksi nomor lain
-	_ = a.Manager.Logout(id)
 	a.Manager.DropAccount(id)
 
+	// Jika akun tidak ada di DB, anggap sukses (idempoten) supaya UI tidak terblokir.
+	if !exists {
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": 0})
+		return
+	}
+
+	// Hapus dari database (ON DELETE CASCADE akan membersihkan groups terkait)
 	if err := a.Store.DeleteAccount(id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -262,6 +282,99 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		"success": success,
 		"failed":  failed,
 	})
+}
+
+// Diagnostic endpoint to quickly find why scheduler didn't send
+// Returns: tz, now (WIB), in_window, windows, templates_active,
+// and per-account: enabled, status, daily_limit, sent_today, eligible_groups.
+func (a *API) handleDiag(w http.ResponseWriter, r *http.Request) {
+	// Determine WIB location with fallback if tzdata missing
+	loc, err := time.LoadLocation("Asia/Jakarta")
+	if err != nil || loc == nil {
+		loc = time.FixedZone("WIB", 7*3600)
+	}
+	now := time.Now().In(loc)
+	windows := [][2]int{{45, 150}, {180, 330}, {1290, 1410}} // 00:45–02:30, 03:00–05:30, 21:30–23:30
+	m := now.Hour()*60 + now.Minute()
+	inWindow := false
+	for _, w2 := range windows {
+		if m >= w2[0] && m <= w2[1] {
+			inWindow = true
+			break
+		}
+	}
+
+	// Count active templates
+	var templatesActive int64
+	_ = a.Store.DB.QueryRow(`SELECT COUNT(*) FROM templates WHERE enabled=1`).Scan(&templatesActive)
+
+	// Accounts diagnostics (enabled accounts only)
+	rows, err := a.Store.DB.Query(`SELECT id,label,enabled,daily_limit,status FROM accounts WHERE enabled=1 ORDER BY created_at DESC`)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	type accDiag struct {
+		ID             string `json:"id"`
+		Label          string `json:"label"`
+		Enabled        bool   `json:"enabled"`
+		Status         string `json:"status"`
+		DailyLimit     int    `json:"daily_limit"`
+		SentToday      int64  `json:"sent_today"`
+		EligibleGroups int64  `json:"eligible_groups"`
+	}
+	var accounts []accDiag
+
+	for rows.Next() {
+		var (
+			id, label, status string
+			enabledInt        int
+			dailyLimit        int
+		)
+		if err := rows.Scan(&id, &label, &enabledInt, &dailyLimit, &status); err != nil {
+			continue
+		}
+
+		// Sent today
+		var sentToday int64
+		_ = a.Store.DB.QueryRow(`
+			SELECT COALESCE(SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END), 0)
+			FROM logs
+			WHERE account_id=? AND ts >= datetime('now','start of day') AND ts < datetime('now','start of day','+1 day')`,
+			id,
+		).Scan(&sentToday)
+
+		// Eligible groups (cooldown 48h, risk < 3, enabled)
+		var eligible int64
+		_ = a.Store.DB.QueryRow(`
+			SELECT COUNT(*)
+			FROM groups
+			WHERE account_id=? AND enabled=1 AND (last_sent_at IS NULL OR last_sent_at < datetime('now','-48 hours')) AND risk_score < 3`,
+			id,
+		).Scan(&eligible)
+
+		accounts = append(accounts, accDiag{
+			ID:             id,
+			Label:          label,
+			Enabled:        enabledInt == 1,
+			Status:         status,
+			DailyLimit:     dailyLimit,
+			SentToday:      sentToday,
+			EligibleGroups: eligible,
+		})
+	}
+
+	out := map[string]any{
+		"tz":               loc.String(),
+		"now":              now.Format(time.RFC3339),
+		"in_window":        inWindow,
+		"windows_minutes":  windows,
+		"templates_active": templatesActive,
+		"accounts":         accounts,
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // Favicon: return 204 to eliminate browser 404 noise
@@ -361,21 +474,12 @@ func (a *API) handleAccountConnect(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "online"})
 }
 
-// Logout akun WA: putus sesi dan hapus client dari cache manager
+// Logout akun WA: best-effort, jangan blokir walau akun tidak ditemukan
 func (a *API) handleAccountLogout(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	exists, err := a.Store.AccountExists(id)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if !exists {
-		writeErr(w, http.StatusNotFound, "account not found")
-		return
-	}
+	// Best-effort: abaikan error agar pengguna bisa membersihkan sesi/cache
 	if err := a.Manager.Logout(id); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+		log.Printf("logout best-effort for %s: %v", id, err)
 	}
 	a.Manager.DropAccount(id)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "logged_out"})
@@ -1752,4 +1856,321 @@ boot();
 </script>
 </body>
 </html>`
+}
+
+// --- Added: bulk enable groups & scheduler trigger diagnostics ---
+
+func (a *API) handleEnableAllGroups(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if strings.TrimSpace(id) == "" {
+		writeErr(w, http.StatusBadRequest, "account id required")
+		return
+	}
+	exists, err := a.Store.AccountExists(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !exists {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	res, err := a.Store.DB.Exec(`UPDATE groups SET enabled=1 WHERE account_id=?`, id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	n, _ := res.RowsAffected()
+	writeJSON(w, http.StatusOK, map[string]any{"updated": n})
+}
+
+// Force one-off send (ignore safe window) to help diagnose "no sends" issues.
+// Strategy: ensure there is at least one active template, then iterate enabled accounts:
+// - connect if paired
+// - check daily limit
+// - pick one eligible group (enabled=1, cooldown 48h, risk<3) randomly
+// - send using random active template
+func (a *API) handleSchedulerTrigger(w http.ResponseWriter, r *http.Request) {
+	// Ensure there is at least one active template
+	var nTpl int64
+	_ = a.Store.DB.QueryRow(`SELECT COUNT(*) FROM templates WHERE enabled=1`).Scan(&nTpl)
+	if nTpl == 0 {
+		writeErr(w, http.StatusBadRequest, "no active template")
+		return
+	}
+
+	// List enabled accounts
+	rows, err := a.Store.DB.Query(`SELECT id, COALESCE(daily_limit,100) FROM accounts WHERE enabled=1 ORDER BY created_at DESC`)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	type attemptInfo struct {
+		AccountID string `json:"account_id"`
+		GroupID   string `json:"group_id"`
+		Status    string `json:"status"`
+		Error     string `json:"error,omitempty"`
+	}
+	var lastErr string
+
+	for rows.Next() {
+		var accID string
+		var daily int
+		if err := rows.Scan(&accID, &daily); err != nil {
+			lastErr = err.Error()
+			continue
+		}
+		if daily <= 0 {
+			daily = 100
+		}
+		// Connect if paired (skip if not paired)
+		if err := a.Manager.ConnectIfPaired(accID); err != nil {
+			lastErr = err.Error()
+			continue
+		}
+		// Count sent today
+		var sentToday int64
+		_ = a.Store.DB.QueryRow(`
+			SELECT COALESCE(SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END), 0)
+			FROM logs
+			WHERE account_id=? AND ts >= datetime('now','start of day') AND ts < datetime('now','start of day','+1 day')
+		`, accID).Scan(&sentToday)
+		if int(sentToday) >= daily {
+			continue
+		}
+		// Pick one eligible group
+		var groupID string
+		err := a.Store.DB.QueryRow(`
+			SELECT id
+			FROM groups
+			WHERE account_id=? AND enabled=1 AND (last_sent_at IS NULL OR last_sent_at < datetime('now','-48 hours')) AND risk_score < 3
+			ORDER BY RANDOM()
+			LIMIT 1
+		`, accID).Scan(&groupID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			lastErr = err.Error()
+			continue
+		}
+		if strings.TrimSpace(groupID) == "" {
+			continue
+		}
+		// Send with random template
+		ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+		defer cancel()
+		if err := a.Sender.SendToGroupUsingRandomTemplate(ctx, accID, groupID); err != nil {
+			writeJSON(w, http.StatusOK, attemptInfo{
+				AccountID: accID,
+				GroupID:   groupID,
+				Status:    "failed",
+				Error:     err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, attemptInfo{
+			AccountID: accID,
+			GroupID:   groupID,
+			Status:    "sent",
+		})
+		return
+	}
+
+	// Nothing eligible
+	if lastErr != "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":  "no_eligible",
+			"message": "no eligible account/group found",
+			"lastErr": lastErr,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "no_eligible",
+		"message": "no eligible account/group found",
+	})
+}
+
+// --- Added: force delete account endpoint ---
+func (a *API) handleForceDeleteAccount(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if strings.TrimSpace(id) == "" {
+		writeErr(w, http.StatusBadRequest, "account id required")
+		return
+	}
+	// Best-effort: logout & drop client cache (abaikan error agar tidak menghalangi penghapusan)
+	_ = a.Manager.Logout(id)
+	a.Manager.DropAccount(id)
+
+	// Hapus akun dari database (ON DELETE CASCADE akan menghapus groups terkait)
+	res, err := a.Store.DB.Exec(`DELETE FROM accounts WHERE id=?`, id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	n, _ := res.RowsAffected()
+
+	// Best-effort: hapus file sesi whatsmeow per akun jika memakai SQLite file terpisah
+	// Pola file default yang dipakai Manager: promote_wa_{accountID}.db
+	// Abaikan error jika file tidak ditemukan.
+	_ = os.Remove("promote_wa_" + id + ".db")
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"deleted": n,
+	})
+}
+
+// --- Ops helpers implementations: account search, delete by msisdn, reset risk/cooldown ---
+
+// Search accounts by msisdn or label (query params: msisdn, label). Falls back to full list if no filter provided.
+func (a *API) handleSearchAccounts(w http.ResponseWriter, r *http.Request) {
+	ms := strings.TrimSpace(r.URL.Query().Get("msisdn"))
+	lb := strings.TrimSpace(r.URL.Query().Get("label"))
+
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	switch {
+	case ms != "" && lb != "":
+		rows, err = a.Store.DB.Query(`SELECT id,label,msisdn,enabled,daily_limit,status,COALESCE(last_error,''),created_at,updated_at 
+			FROM accounts 
+			WHERE msisdn LIKE ? OR label LIKE ?
+			ORDER BY created_at DESC`, "%"+ms+"%", "%"+lb+"%")
+	case ms != "":
+		rows, err = a.Store.DB.Query(`SELECT id,label,msisdn,enabled,daily_limit,status,COALESCE(last_error,''),created_at,updated_at 
+			FROM accounts 
+			WHERE msisdn LIKE ?
+			ORDER BY created_at DESC`, "%"+ms+"%")
+	case lb != "":
+		rows, err = a.Store.DB.Query(`SELECT id,label,msisdn,enabled,daily_limit,status,COALESCE(last_error,''),created_at,updated_at 
+			FROM accounts 
+			WHERE label LIKE ?
+			ORDER BY created_at DESC`, "%"+lb+"%")
+	default:
+		rows, err = a.Store.DB.Query(`SELECT id,label,msisdn,enabled,daily_limit,status,COALESCE(last_error,''),created_at,updated_at 
+			FROM accounts ORDER BY created_at DESC`)
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var list []model.Account
+	for rows.Next() {
+		var a1 model.Account
+		var enabledInt int
+		if err := rows.Scan(&a1.ID, &a1.Label, &a1.Msisdn, &enabledInt, &a1.DailyLimit, &a1.Status, &a1.LastError, &a1.CreatedAt, &a1.UpdatedAt); err != nil {
+			continue
+		}
+		a1.Enabled = enabledInt == 1
+		list = append(list, a1)
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+type deleteByMSISDNReq struct {
+	Msisdn string `json:"msisdn"`
+}
+
+// Delete account by exact msisdn (best-effort logout, drop client, DB delete, remove session file).
+// Returns {"deleted": 0|1, "id": "<account_id-if-found>"}
+func (a *API) handleDeleteByMSISDN(w http.ResponseWriter, r *http.Request) {
+	var req deleteByMSISDNReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	ms := strings.TrimSpace(req.Msisdn)
+	if ms == "" {
+		writeErr(w, http.StatusBadRequest, "msisdn required")
+		return
+	}
+	var id string
+	err := a.Store.DB.QueryRow(`SELECT id FROM accounts WHERE msisdn=? LIMIT 1`, ms).Scan(&id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusOK, map[string]any{"deleted": 0})
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Best-effort session cleanup
+	if err := a.Manager.Logout(id); err != nil {
+		log.Printf("delete_by_msisdn: logout best-effort for %s: %v", id, err)
+	}
+	a.Manager.DropAccount(id)
+
+	// Delete from DB
+	res, err := a.Store.DB.Exec(`DELETE FROM accounts WHERE id=?`, id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	n, _ := res.RowsAffected()
+
+	// Remove per-account whatsmeow session file (best-effort)
+	_ = os.Remove("promote_wa_" + id + ".db")
+
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": n, "id": id})
+}
+
+type resetRiskCooldownReq struct {
+	GroupIDs []string `json:"group_ids"`
+}
+
+// Reset groups risk_score=0 and last_sent_at=NULL for an account.
+// If body contains group_ids, only those groups are updated; otherwise all groups of the account.
+func (a *API) handleResetRiskCooldown(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if strings.TrimSpace(id) == "" {
+		writeErr(w, http.StatusBadRequest, "account id required")
+		return
+	}
+
+	var body resetRiskCooldownReq
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	if len(body.GroupIDs) > 0 {
+		tx, err := a.Store.DB.Begin()
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		var updated int64
+		for _, gid := range body.GroupIDs {
+			g := strings.TrimSpace(gid)
+			if g == "" {
+				continue
+			}
+			res, err := tx.Exec(`UPDATE groups SET risk_score=0, last_sent_at=NULL WHERE id=? AND account_id=?`, g, id)
+			if err != nil {
+				_ = tx.Rollback()
+				writeErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			n, _ := res.RowsAffected()
+			updated += n
+		}
+		if err := tx.Commit(); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"updated": updated})
+		return
+	}
+
+	res, err := a.Store.DB.Exec(`UPDATE groups SET risk_score=0, last_sent_at=NULL WHERE account_id=?`, id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	n, _ := res.RowsAffected()
+	writeJSON(w, http.StatusOK, map[string]any{"updated": n})
 }

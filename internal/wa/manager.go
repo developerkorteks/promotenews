@@ -207,7 +207,16 @@ func (m *Manager) ConnectIfPaired(accountID string) error {
 		return fmt.Errorf("not paired")
 	}
 	m.ClientLogger.Infof("connect: account=%s", accountID)
-	return client.Connect()
+	// Toleransi jika sudah terkoneksi: whatsmeow.Connect() kadang mengembalikan error "already connected".
+	if err := client.Connect(); err != nil {
+		ls := strings.ToLower(err.Error())
+		if strings.Contains(ls, "already") || strings.Contains(ls, "connected") {
+			// Anggap sukses; koneksi sudah aktif.
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 /*

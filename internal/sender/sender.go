@@ -149,6 +149,13 @@ func (s *Sender) SendToGroup(ctx context.Context, accountID, groupJID string, co
 	if cli.Store == nil || cli.Store.ID == nil {
 		return fmt.Errorf("account %s not paired/connected", accountID)
 	}
+	// Pastikan koneksi aktif sebelum mengirim. Toleransi error "already connected".
+	if err := cli.Connect(); err != nil {
+		ls := strings.ToLower(err.Error())
+		if !(strings.Contains(ls, "already") || strings.Contains(ls, "connected")) {
+			return fmt.Errorf("connect: %w", err)
+		}
+	}
 
 	// Parse JID
 	jid, err := types.ParseJID(groupJID)
