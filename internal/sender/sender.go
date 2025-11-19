@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
@@ -22,12 +23,15 @@ import (
 )
 
 type MessageContent struct {
-	Text        string   `json:"text"`
-	ImageURLs   []string `json:"image_urls"`
-	VideoURLs   []string `json:"video_urls"`
-	AudioURLs   []string `json:"audio_urls"`
-	StickerURLs []string `json:"sticker_urls"`
-	DocURLs     []string `json:"doc_urls"`
+	TextOnly      string   `json:"text_only"`
+	ImageURLs     []string `json:"image_urls"`
+	ImageCaption  string   `json:"image_caption"`
+	VideoURLs     []string `json:"video_urls"`
+	VideoCaption  string   `json:"video_caption"`
+	AudioURLs     []string `json:"audio_urls"`
+	StickerURLs   []string `json:"sticker_urls"`
+	DocURLs       []string `json:"doc_urls"`
+	DocCaption    string   `json:"doc_caption"`
 }
 
 type Sender struct {
@@ -142,6 +146,11 @@ func (s *Sender) bumpRiskAndMaybePause(groupID string) {
 // SendToGroup sends content to a group JID string like "12345-67890@g.us" via a specific account.
 // It personalizes "{group_name}" placeholder when available.
 func (s *Sender) SendToGroup(ctx context.Context, accountID, groupJID string, content MessageContent) error {
+	return s.SendToGroupWithSession(ctx, accountID, groupJID, content, "")
+}
+
+// SendToGroupWithSession sends content with a specific session ID for grouping logs
+func (s *Sender) SendToGroupWithSession(ctx context.Context, accountID, groupJID string, content MessageContent, sessionID string) error {
 	cli, err := s.Manager.GetClient(accountID)
 	if err != nil {
 		return err
@@ -163,121 +172,150 @@ func (s *Sender) SendToGroup(ctx context.Context, accountID, groupJID string, co
 		return fmt.Errorf("parse JID: %w", err)
 	}
 
+	// Generate session ID if not provided
+	if sessionID == "" {
+		sessionID = uuid.NewString()
+	}
+
 	// Load group name for personalization
 	groupName := s.lookupGroupName(groupJID)
-
-	// 1) Send text if provided (with retry/backoff)
-	if strings.TrimSpace(content.Text) != "" {
-		text := personalize(content.Text, groupName)
+	
+	// Calculate component count for logging
+	componentCount := 0
+	if strings.TrimSpace(content.TextOnly) != "" { componentCount++ }
+	componentCount += len(content.ImageURLs) + len(content.VideoURLs) + len(content.AudioURLs) + len(content.StickerURLs) + len(content.DocURLs)
+	
+	start := time.Now()
+	log.Printf("[sender] START_CAMPAIGN account=%s group=%s session=%s components=%d timestamp=%s", 
+		accountID, groupJID, sessionID, componentCount, start.Format(time.RFC3339))
+	
+	// 1) Send text-only message if provided
+	if strings.TrimSpace(content.TextOnly) != "" {
+		text := personalize(content.TextOnly, groupName)
 		err := withRetry(ctx, func() error {
 			return s.sendText(ctx, cli, jid, text)
 		})
 		if err != nil {
-			_ = s.logResult(accountID, groupJID, "", "failed", short(text), err.Error(), maxAttempts, time.Now())
+			_ = s.logResult(accountID, groupJID, "", sessionID, "failed", short(text), err.Error(), maxAttempts, time.Now())
 			s.bumpRiskAndMaybePause(groupJID)
-			log.Printf("[sender] text failed account=%s group=%s err=%v", accountID, groupJID, err)
+			log.Printf("[sender] text-only failed account=%s group=%s session=%s err=%v", accountID, groupJID, sessionID, err)
 			return err
 		}
-		_ = s.logResult(accountID, groupJID, "", "sent", short(content.Text), "", 1, time.Now())
+		_ = s.logResult(accountID, groupJID, "", sessionID, "sent", "text-only:"+short(content.TextOnly), "", 1, time.Now())
 		// small human-like pause between parts
 		if err := sleepRange(ctx, 1*time.Second, 2*time.Second); err != nil {
 			return err
 		}
 	}
 
-	// 2) Send images (with retry/backoff per media)
+	// 2) Send images with custom captions
 	for idx, u := range content.ImageURLs {
-		caption := personalize(content.Text, groupName)
+		caption := personalize(content.ImageCaption, groupName)
 		err := withRetry(ctx, func() error {
 			return s.sendImageByURL(ctx, cli, jid, u, caption)
 		})
 		if err != nil {
-			_ = s.logResult(accountID, groupJID, "", "failed", "image:"+u, err.Error(), idx+1, time.Now())
+			_ = s.logResult(accountID, groupJID, "", sessionID, "failed", "image:"+u, err.Error(), idx+1, time.Now())
 			s.bumpRiskAndMaybePause(groupJID)
-			log.Printf("[sender] image failed account=%s group=%s url=%s err=%v", accountID, groupJID, u, err)
+			log.Printf("[sender] image failed account=%s group=%s session=%s url=%s err=%v", accountID, groupJID, sessionID, u, err)
 			return err
 		}
-		_ = s.logResult(accountID, groupJID, "", "sent", "image:"+u, "", idx+1, time.Now())
+		preview := "image:" + u
+		if caption != "" {
+			preview += " (caption:" + short(caption) + ")"
+		}
+		_ = s.logResult(accountID, groupJID, "", sessionID, "sent", preview, "", idx+1, time.Now())
 		// pacing
 		if err := sleepRange(ctx, 1200*time.Millisecond, 2500*time.Millisecond); err != nil {
 			return err
 		}
 	}
 
-	// 3) Send videos (with retry/backoff per media)
+	// 3) Send videos with custom captions
 	for idx, u := range content.VideoURLs {
-		caption := personalize(content.Text, groupName)
+		caption := personalize(content.VideoCaption, groupName)
 		err := withRetry(ctx, func() error {
 			return s.sendVideoByURL(ctx, cli, jid, u, caption)
 		})
 		if err != nil {
-			_ = s.logResult(accountID, groupJID, "", "failed", "video:"+u, err.Error(), idx+1, time.Now())
+			_ = s.logResult(accountID, groupJID, "", sessionID, "failed", "video:"+u, err.Error(), idx+1, time.Now())
 			s.bumpRiskAndMaybePause(groupJID)
-			log.Printf("[sender] video failed account=%s group=%s url=%s err=%v", accountID, groupJID, u, err)
+			log.Printf("[sender] video failed account=%s group=%s session=%s url=%s err=%v", accountID, groupJID, sessionID, u, err)
 			return err
 		}
-		_ = s.logResult(accountID, groupJID, "", "sent", "video:"+u, "", idx+1, time.Now())
+		preview := "video:" + u
+		if caption != "" {
+			preview += " (caption:" + short(caption) + ")"
+		}
+		_ = s.logResult(accountID, groupJID, "", sessionID, "sent", preview, "", idx+1, time.Now())
 		if err := sleepRange(ctx, 1500*time.Millisecond, 3000*time.Millisecond); err != nil {
 			return err
 		}
 	}
 
-	// 4) Send audios (with retry/backoff per media)
+	// 4) Send audios (audio cannot have captions)
 	for idx, u := range content.AudioURLs {
 		err := withRetry(ctx, func() error {
 			return s.sendAudioByURL(ctx, cli, jid, u)
 		})
 		if err != nil {
-			_ = s.logResult(accountID, groupJID, "", "failed", "audio:"+u, err.Error(), idx+1, time.Now())
+			_ = s.logResult(accountID, groupJID, "", sessionID, "failed", "audio:"+u, err.Error(), idx+1, time.Now())
 			s.bumpRiskAndMaybePause(groupJID)
-			log.Printf("[sender] audio failed account=%s group=%s url=%s err=%v", accountID, groupJID, u, err)
+			log.Printf("[sender] audio failed account=%s group=%s session=%s url=%s err=%v", accountID, groupJID, sessionID, u, err)
 			return err
 		}
-		_ = s.logResult(accountID, groupJID, "", "sent", "audio:"+u, "", idx+1, time.Now())
+		_ = s.logResult(accountID, groupJID, "", sessionID, "sent", "audio:"+u, "", idx+1, time.Now())
 		// pacing
 		if err := sleepRange(ctx, 1200*time.Millisecond, 2500*time.Millisecond); err != nil {
 			return err
 		}
 	}
 
-	// 5) Send stickers (with retry/backoff per media)
+	// 5) Send stickers (stickers cannot have captions)
 	for idx, u := range content.StickerURLs {
 		err := withRetry(ctx, func() error {
 			return s.sendStickerByURL(ctx, cli, jid, u)
 		})
 		if err != nil {
-			_ = s.logResult(accountID, groupJID, "", "failed", "sticker:"+u, err.Error(), idx+1, time.Now())
+			_ = s.logResult(accountID, groupJID, "", sessionID, "failed", "sticker:"+u, err.Error(), idx+1, time.Now())
 			s.bumpRiskAndMaybePause(groupJID)
-			log.Printf("[sender] sticker failed account=%s group=%s url=%s err=%v", accountID, groupJID, u, err)
+			log.Printf("[sender] sticker failed account=%s group=%s session=%s url=%s err=%v", accountID, groupJID, sessionID, u, err)
 			return err
 		}
-		_ = s.logResult(accountID, groupJID, "", "sent", "sticker:"+u, "", idx+1, time.Now())
+		_ = s.logResult(accountID, groupJID, "", sessionID, "sent", "sticker:"+u, "", idx+1, time.Now())
 		// pacing
 		if err := sleepRange(ctx, 1200*time.Millisecond, 2500*time.Millisecond); err != nil {
 			return err
 		}
 	}
 
-	// 6) Send documents (with retry/backoff per media)
+	// 6) Send documents with custom captions
 	for idx, u := range content.DocURLs {
-		caption := personalize(content.Text, groupName)
+		caption := personalize(content.DocCaption, groupName)
 		err := withRetry(ctx, func() error {
 			return s.sendDocumentByURL(ctx, cli, jid, u, caption)
 		})
 		if err != nil {
-			_ = s.logResult(accountID, groupJID, "", "failed", "doc:"+u, err.Error(), idx+1, time.Now())
+			_ = s.logResult(accountID, groupJID, "", sessionID, "failed", "doc:"+u, err.Error(), idx+1, time.Now())
 			s.bumpRiskAndMaybePause(groupJID)
-			log.Printf("[sender] document failed account=%s group=%s url=%s err=%v", accountID, groupJID, u, err)
+			log.Printf("[sender] document failed account=%s group=%s session=%s url=%s err=%v", accountID, groupJID, sessionID, u, err)
 			return err
 		}
-		_ = s.logResult(accountID, groupJID, "", "sent", "doc:"+u, "", idx+1, time.Now())
+		preview := "doc:" + u
+		if caption != "" {
+			preview += " (caption:" + short(caption) + ")"
+		}
+		_ = s.logResult(accountID, groupJID, "", sessionID, "sent", preview, "", idx+1, time.Now())
 		if err := sleepRange(ctx, 1500*time.Millisecond, 3000*time.Millisecond); err != nil {
 			return err
 		}
 	}
 
-	// update last_sent_at for cadence enforcement
-	_, _ = s.Store.DB.Exec(`UPDATE groups SET last_sent_at=CURRENT_TIMESTAMP WHERE id=?`, groupJID)
+	// Log campaign completion
+	duration := time.Since(start)
+	log.Printf("[sender] END_CAMPAIGN account=%s group=%s session=%s success=true duration=%s", 
+		accountID, groupJID, sessionID, duration)
+	
 	return nil
 }
 
@@ -516,10 +554,10 @@ func (s *Sender) fetch(ctx context.Context, url string) ([]byte, string, error) 
 	return body, ct, nil
 }
 
-func (s *Sender) logResult(accountID, groupID, campaignID, status, preview, errMsg string, attempt int, scheduled time.Time) error {
-	_, err := s.Store.DB.Exec(`INSERT INTO logs (account_id,group_id,campaign_id,status,error,message_preview,attempt,scheduled_for) 
-	VALUES (?,?,?,?,?,?,?,?)`,
-		accountID, groupID, nullIfEmpty(campaignID), status, errMsg, preview, attempt, scheduled)
+func (s *Sender) logResult(accountID, groupID, campaignID, sessionID, status, preview, errMsg string, attempt int, scheduled time.Time) error {
+	_, err := s.Store.DB.Exec(`INSERT INTO logs (account_id,group_id,campaign_id,campaign_session_id,status,error,message_preview,attempt,scheduled_for) 
+	VALUES (?,?,?,?,?,?,?,?,?)`,
+		accountID, groupID, nullIfEmpty(campaignID), nullIfEmpty(sessionID), status, errMsg, preview, attempt, scheduled)
 	return err
 }
 
@@ -575,28 +613,36 @@ func nullIfEmpty(s string) any {
 
 // Build MessageContent from a random enabled template (DB-level rotation).
 func (s *Sender) RandomTemplateContent(ctx context.Context) (MessageContent, error) {
-	var text, imgJSON, vidJSON, stJSON, docJSON string
+	var textOnly, imgJSON, imgCaption, vidJSON, vidCaption, stJSON, docJSON, docCaption, audioJSON string
 	err := s.Store.DB.QueryRowContext(ctx, `
 		SELECT
-			COALESCE(text,''),
+			COALESCE(text_only,''),
 			COALESCE(images_json,''),
+			COALESCE(images_caption,''),
 			COALESCE(videos_json,''),
+			COALESCE(videos_caption,''),
 			COALESCE(stickers_json,''),
-			COALESCE(docs_json,'')
+			COALESCE(docs_json,''),
+			COALESCE(docs_caption,''),
+			COALESCE(audio_json,'')
 		FROM templates
 		WHERE enabled=1
 		ORDER BY RANDOM()
 		LIMIT 1
-	`).Scan(&text, &imgJSON, &vidJSON, &stJSON, &docJSON)
+	`).Scan(&textOnly, &imgJSON, &imgCaption, &vidJSON, &vidCaption, &stJSON, &docJSON, &docCaption, &audioJSON)
 	if err != nil {
 		return MessageContent{}, err
 	}
 	content := MessageContent{
-		Text:        text,
-		ImageURLs:   parseJSONArr(imgJSON),
-		VideoURLs:   parseJSONArr(vidJSON),
-		StickerURLs: parseJSONArr(stJSON),
-		DocURLs:     parseJSONArr(docJSON),
+		TextOnly:      textOnly,
+		ImageURLs:     parseJSONArr(imgJSON),
+		ImageCaption:  imgCaption,
+		VideoURLs:     parseJSONArr(vidJSON),
+		VideoCaption:  vidCaption,
+		StickerURLs:   parseJSONArr(stJSON),
+		DocURLs:       parseJSONArr(docJSON),
+		DocCaption:    docCaption,
+		AudioURLs:     parseJSONArr(audioJSON),
 	}
 	return content, nil
 }
@@ -607,7 +653,10 @@ func (s *Sender) SendToGroupUsingRandomTemplate(ctx context.Context, accountID, 
 	if err != nil {
 		return fmt.Errorf("no active template or query failed: %w", err)
 	}
-	return s.SendToGroup(ctx, accountID, groupJID, content)
+	
+	// Generate session ID for this campaign
+	sessionID := uuid.NewString()
+	return s.SendToGroupWithSession(ctx, accountID, groupJID, content, sessionID)
 }
 
 func parseJSONArr(s string) []string {

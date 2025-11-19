@@ -92,6 +92,7 @@ func (a *API) routes() {
 	// Group participants & CSV export
 	a.Router.Get("/api/accounts/{id}/groups/{gid}/participants", a.handleGroupParticipants)
 	a.Router.Get("/api/accounts/{id}/groups/{gid}/participants.csv", a.handleGroupParticipantsCSV)
+	a.Router.Post("/api/accounts/{id}/groups/{gid}/participants/refresh", a.handleRefreshParticipants)
 
 	// Send test (manual trigger) endpoint
 	a.Router.Post("/api/send/test", a.handleSendTest)
@@ -574,16 +575,54 @@ func (a *API) handleGroupParticipantsCSV(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// Refresh participants - force refresh from WhatsApp (invalidate cache)
+func (a *API) handleRefreshParticipants(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	gid := chi.URLParam(r, "gid")
+	exists, err := a.Store.AccountExists(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !exists {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	
+	// Invalidate cache first
+	if err := a.Store.InvalidateGroupParticipantsCache(gid); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to invalidate cache: "+err.Error())
+		return
+	}
+	
+	// Fetch fresh data from WhatsApp
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	parts, err := a.Manager.GetGroupParticipants(ctx, id, gid)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	
+	writeJSON(w, http.StatusOK, map[string]any{
+		"refreshed": len(parts),
+		"participants": parts,
+	})
+}
+
 // Send test API
 type sendTestReq struct {
-	AccountID   string   `json:"account_id"`
-	GroupID     string   `json:"group_id"`
-	Text        string   `json:"text"`
-	ImageURLs   []string `json:"image_urls"`
-	VideoURLs   []string `json:"video_urls"`
-	AudioURLs   []string `json:"audio_urls"`
-	StickerURLs []string `json:"sticker_urls"`
-	DocURLs     []string `json:"doc_urls"`
+	AccountID     string   `json:"account_id"`
+	GroupID       string   `json:"group_id"`
+	TextOnly      string   `json:"text_only"`
+	ImageURLs     []string `json:"image_urls"`
+	ImageCaption  string   `json:"image_caption"`
+	VideoURLs     []string `json:"video_urls"`
+	VideoCaption  string   `json:"video_caption"`
+	AudioURLs     []string `json:"audio_urls"`
+	StickerURLs   []string `json:"sticker_urls"`
+	DocURLs       []string `json:"doc_urls"`
+	DocCaption    string   `json:"doc_caption"`
 }
 
 func (a *API) handleSendTest(w http.ResponseWriter, r *http.Request) {
@@ -599,12 +638,15 @@ func (a *API) handleSendTest(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 	content := sender.MessageContent{
-		Text:        req.Text,
-		ImageURLs:   req.ImageURLs,
-		VideoURLs:   req.VideoURLs,
-		AudioURLs:   req.AudioURLs,
-		StickerURLs: req.StickerURLs,
-		DocURLs:     req.DocURLs,
+		TextOnly:      req.TextOnly,
+		ImageURLs:     req.ImageURLs,
+		ImageCaption:  req.ImageCaption,
+		VideoURLs:     req.VideoURLs,
+		VideoCaption:  req.VideoCaption,
+		AudioURLs:     req.AudioURLs,
+		StickerURLs:   req.StickerURLs,
+		DocURLs:       req.DocURLs,
+		DocCaption:    req.DocCaption,
 	}
 	if err := a.Sender.SendToGroup(ctx, req.AccountID, req.GroupID, content); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -631,12 +673,65 @@ func (a *API) handleLogsStream(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(":ok\n\n"))
 	flusher.Flush()
 
+	// Send last 50 logs on initial connect
+	initialRows, err := a.Store.DB.Query(`SELECT id, ts, account_id, group_id, COALESCE(campaign_id,''), COALESCE(campaign_session_id,''), status, COALESCE(error,''), message_preview, attempt, scheduled_for
+		FROM logs ORDER BY id DESC LIMIT 50`)
+	if err == nil {
+		var initialLogs []map[string]any
+		for initialRows.Next() {
+			var (
+				id                                                          int64
+				ts                                                          time.Time
+				accountID, groupID, campaignID, sessionID, status, errMsg string
+				preview                                                     string
+				attempt                                                     int
+				scheduled                                                   sql.NullTime
+			)
+			if err := initialRows.Scan(&id, &ts, &accountID, &groupID, &campaignID, &sessionID, &status, &errMsg, &preview, &attempt, &scheduled); err != nil {
+				continue
+			}
+			if id > lastID {
+				lastID = id
+			}
+			initialLogs = append(initialLogs, map[string]any{
+				"id":                    id,
+				"ts":                    ts.Format(time.RFC3339),
+				"account_id":            accountID,
+				"group_id":              groupID,
+				"campaign_id":           campaignID,
+				"campaign_session_id":   sessionID,
+				"status":                status,
+				"error":                 errMsg,
+				"message_preview":       preview,
+				"attempt":               attempt,
+				"scheduled_for": func() string {
+					if scheduled.Valid {
+						return scheduled.Time.Format(time.RFC3339)
+					}
+					return ""
+				}(),
+			})
+		}
+		initialRows.Close()
+		// Send in reverse order (oldest first)
+		for i := len(initialLogs) - 1; i >= 0; i-- {
+			b, err := json.Marshal(initialLogs[i])
+			if err != nil {
+				continue
+			}
+			_, _ = w.Write([]byte("data: "))
+			_, _ = w.Write(b)
+			_, _ = w.Write([]byte("\n\n"))
+		}
+		flusher.Flush()
+	}
+
 	for {
 		select {
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:
-			rows, err := a.Store.DB.Query(`SELECT id, ts, account_id, group_id, campaign_id, status, COALESCE(error,''), message_preview, attempt, scheduled_for
+			rows, err := a.Store.DB.Query(`SELECT id, ts, account_id, group_id, COALESCE(campaign_id,''), COALESCE(campaign_session_id,''), status, COALESCE(error,''), message_preview, attempt, scheduled_for
 				FROM logs WHERE id > ? ORDER BY id ASC LIMIT 100`, lastID)
 			if err != nil {
 				// keep trying
@@ -644,29 +739,30 @@ func (a *API) handleLogsStream(w http.ResponseWriter, r *http.Request) {
 			}
 			for rows.Next() {
 				var (
-					id                                             int64
-					ts                                             time.Time
-					accountID, groupID, campaignID, status, errMsg string
-					preview                                        string
-					attempt                                        int
-					scheduled                                      sql.NullTime
+					id                                                          int64
+					ts                                                          time.Time
+					accountID, groupID, campaignID, sessionID, status, errMsg string
+					preview                                                     string
+					attempt                                                     int
+					scheduled                                                   sql.NullTime
 				)
-				if err := rows.Scan(&id, &ts, &accountID, &groupID, &campaignID, &status, &errMsg, &preview, &attempt, &scheduled); err != nil {
+				if err := rows.Scan(&id, &ts, &accountID, &groupID, &campaignID, &sessionID, &status, &errMsg, &preview, &attempt, &scheduled); err != nil {
 					continue
 				}
 				if id > lastID {
 					lastID = id
 				}
 				payload := map[string]any{
-					"id":              id,
-					"ts":              ts.Format(time.RFC3339),
-					"account_id":      accountID,
-					"group_id":        groupID,
-					"campaign_id":     campaignID,
-					"status":          status,
-					"error":           errMsg,
-					"message_preview": preview,
-					"attempt":         attempt,
+					"id":                    id,
+					"ts":                    ts.Format(time.RFC3339),
+					"account_id":            accountID,
+					"group_id":              groupID,
+					"campaign_id":           campaignID,
+					"campaign_session_id":   sessionID,
+					"status":                status,
+					"error":                 errMsg,
+					"message_preview":       preview,
+					"attempt":               attempt,
 					"scheduled_for": func() string {
 						if scheduled.Valid {
 							return scheduled.Time.Format(time.RFC3339)
@@ -691,18 +787,29 @@ func (a *API) handleLogsStream(w http.ResponseWriter, r *http.Request) {
 /********** Templates (Global) Management **********/
 
 type upsertTemplateReq struct {
-	Name        string   `json:"name"`
-	Text        string   `json:"text"`
-	ImageURLs   []string `json:"image_urls"`
-	VideoURLs   []string `json:"video_urls"`
-	AudioURLs   []string `json:"audio_urls"`
-	StickerURLs []string `json:"sticker_urls"`
-	DocURLs     []string `json:"doc_urls"`
-	Enabled     bool     `json:"enabled"`
+	Name          string   `json:"name"`
+	TextOnly      string   `json:"text_only"`
+	ImageURLs     []string `json:"image_urls"`
+	ImageCaption  string   `json:"image_caption"`
+	VideoURLs     []string `json:"video_urls"`
+	VideoCaption  string   `json:"video_caption"`
+	AudioURLs     []string `json:"audio_urls"`
+	StickerURLs   []string `json:"sticker_urls"`
+	DocURLs       []string `json:"doc_urls"`
+	DocCaption    string   `json:"doc_caption"`
+	Enabled       bool     `json:"enabled"`
 }
 
 func (a *API) handleListTemplates(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.Store.DB.Query(`SELECT id,name,COALESCE(text,''),COALESCE(images_json,''),COALESCE(videos_json,''),COALESCE(audio_json,''),COALESCE(stickers_json,''),COALESCE(docs_json,''),enabled,created_at,updated_at
+	rows, err := a.Store.DB.Query(`SELECT 
+		id, name, 
+		COALESCE(text_only,''), 
+		COALESCE(images_json,''), COALESCE(images_caption,''),
+		COALESCE(videos_json,''), COALESCE(videos_caption,''),
+		COALESCE(audio_json,''),
+		COALESCE(stickers_json,''),
+		COALESCE(docs_json,''), COALESCE(docs_caption,''),
+		enabled, created_at, updated_at
 		FROM templates ORDER BY created_at DESC`)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -712,26 +819,29 @@ func (a *API) handleListTemplates(w http.ResponseWriter, r *http.Request) {
 	var out []map[string]any
 	for rows.Next() {
 		var (
-			id, name, text, imgJSON, vidJSON, audJSON, stJSON, docJSON string
-			enabledInt                                                 int
-			created, updated                                           time.Time
+			id, name, textOnly, imgJSON, imgCaption, vidJSON, vidCaption, audJSON, stJSON, docJSON, docCaption string
+			enabledInt                                                                                          int
+			created, updated                                                                                    time.Time
 		)
-		if err := rows.Scan(&id, &name, &text, &imgJSON, &vidJSON, &audJSON, &stJSON, &docJSON, &enabledInt, &created, &updated); err != nil {
+		if err := rows.Scan(&id, &name, &textOnly, &imgJSON, &imgCaption, &vidJSON, &vidCaption, &audJSON, &stJSON, &docJSON, &docCaption, &enabledInt, &created, &updated); err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		out = append(out, map[string]any{
-			"id":           id,
-			"name":         name,
-			"text":         text,
-			"image_urls":   parseJSONArray(imgJSON),
-			"video_urls":   parseJSONArray(vidJSON),
-			"audio_urls":   parseJSONArray(audJSON),
-			"sticker_urls": parseJSONArray(stJSON),
-			"doc_urls":     parseJSONArray(docJSON),
-			"enabled":      enabledInt == 1,
-			"created_at":   created.Format(time.RFC3339),
-			"updated_at":   updated.Format(time.RFC3339),
+			"id":            id,
+			"name":          name,
+			"text_only":     textOnly,
+			"image_urls":    parseJSONArray(imgJSON),
+			"image_caption": imgCaption,
+			"video_urls":    parseJSONArray(vidJSON),
+			"video_caption": vidCaption,
+			"audio_urls":    parseJSONArray(audJSON),
+			"sticker_urls":  parseJSONArray(stJSON),
+			"doc_urls":      parseJSONArray(docJSON),
+			"doc_caption":   docCaption,
+			"enabled":       enabledInt == 1,
+			"created_at":    created.Format(time.RFC3339),
+			"updated_at":    updated.Format(time.RFC3339),
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -744,14 +854,14 @@ func (a *API) handleCreateTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := uuid.NewString()
-	_, err := a.Store.DB.Exec(`INSERT INTO templates (id,name,text,images_json,videos_json,audio_json,stickers_json,docs_json,enabled,created_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-		id, req.Name, req.Text,
-		toJSONArray(req.ImageURLs),
-		toJSONArray(req.VideoURLs),
+	_, err := a.Store.DB.Exec(`INSERT INTO templates (id,name,text_only,images_json,images_caption,videos_json,videos_caption,audio_json,stickers_json,docs_json,docs_caption,enabled,created_at,updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+		id, req.Name, req.TextOnly,
+		toJSONArray(req.ImageURLs), req.ImageCaption,
+		toJSONArray(req.VideoURLs), req.VideoCaption,
 		toJSONArray(req.AudioURLs),
 		toJSONArray(req.StickerURLs),
-		toJSONArray(req.DocURLs),
+		toJSONArray(req.DocURLs), req.DocCaption,
 		btoi(req.Enabled),
 	)
 	if err != nil {
@@ -816,14 +926,14 @@ func (a *API) handleUpdateTemplate(w http.ResponseWriter, r *http.Request) {
 	enabled := req.Enabled
 	// Run update
 	res, err := a.Store.DB.Exec(`UPDATE templates
-		SET name=?, text=?, images_json=?, videos_json=?, audio_json=?, stickers_json=?, docs_json=?, enabled=?, updated_at=CURRENT_TIMESTAMP
+		SET name=?, text_only=?, images_json=?, images_caption=?, videos_json=?, videos_caption=?, audio_json=?, stickers_json=?, docs_json=?, docs_caption=?, enabled=?, updated_at=CURRENT_TIMESTAMP
 		WHERE id=?`,
-		req.Name, req.Text,
-		toJSONArray(req.ImageURLs),
-		toJSONArray(req.VideoURLs),
+		req.Name, req.TextOnly,
+		toJSONArray(req.ImageURLs), req.ImageCaption,
+		toJSONArray(req.VideoURLs), req.VideoCaption,
 		toJSONArray(req.AudioURLs),
 		toJSONArray(req.StickerURLs),
-		toJSONArray(req.DocURLs),
+		toJSONArray(req.DocURLs), req.DocCaption,
 		btoi(enabled),
 		id,
 	)
@@ -1057,33 +1167,53 @@ small.mono{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
 </section>
 
 <section id="send-test">
-  <h3>Kirim Uji</h3>
+  <h3>Kirim Uji (dengan Caption per Media)</h3>
   <div class="row">
     <label for="send-account">Akun</label>
     <select id="send-account"></select>
-    <label for="send-group-id">Group JID</label>
+    <label for="send-group">Pilih Grup</label>
+    <select id="send-group" style="width:300px"></select>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <small class="mono">Atau isi manual Group JID:</small>
     <input id="send-group-id" placeholder="mis. 12345-67890@g.us" style="width:280px">
   </div>
   <div class="row" style="margin-top:8px">
-    <label for="send-text">Teks Promo</label>
-    <textarea id="send-text" placeholder="Gunakan {group_name} untuk personalisasi" rows="3" style="width:100%"></textarea>
+    <label for="send-text-only">Text-Only Message</label>
+    <textarea id="send-text-only" placeholder="Pesan text saja tanpa media (gunakan {group_name} untuk personalisasi)" rows="2" style="width:100%"></textarea>
   </div>
   <div class="row" style="margin-top:8px">
     <label for="send-file-image">Gambar</label>
     <input type="file" id="send-file-image" accept="image/*" multiple>
+    <label for="send-img-caption">Caption Gambar</label>
+    <textarea id="send-img-caption" placeholder="Caption khusus untuk gambar" rows="2" style="width:300px"></textarea>
+  </div>
+  <div class="row" style="margin-top:8px">
     <label for="send-file-video">Video</label>
     <input type="file" id="send-file-video" accept="video/*" multiple>
+    <label for="send-vid-caption">Caption Video</label>
+    <textarea id="send-vid-caption" placeholder="Caption khusus untuk video" rows="2" style="width:300px"></textarea>
+  </div>
+  <div class="row" style="margin-top:8px">
     <label for="send-file-audio">Audio/Voice</label>
     <input type="file" id="send-file-audio" accept="audio/*" multiple>
+    <small class="mono">Audio tidak support caption</small>
   </div>
   <div class="row" style="margin-top:8px">
     <label for="send-file-sticker">Sticker (webp)</label>
     <input type="file" id="send-file-sticker" accept="image/webp" multiple>
+    <small class="mono">Sticker tidak support caption</small>
+  </div>
+  <div class="row" style="margin-top:8px">
     <label for="send-file-doc">Dokumen</label>
     <input type="file" id="send-file-doc" multiple>
+    <label for="send-doc-caption">Caption Dokumen</label>
+    <textarea id="send-doc-caption" placeholder="Caption khusus untuk dokumen" rows="2" style="width:300px"></textarea>
+  </div>
+  <div class="row" style="margin-top:8px">
     <button id="btn-send-test">Kirim Uji</button>
   </div>
-  <small class="mono">Petunjuk upload: pilih file di input sesuai jenisnya. Sistem akan mengunggah ke /uploads lalu mengirim dengan delay natural antar bagian konten.</small>
+  <small class="mono">Kirim Uji Baru: Text-only untuk pesan murni teks ATAU media dengan caption terpisah per jenis. Tidak ada duplikasi text.</small>
 </section>
 
 <section id="participants">
@@ -1116,37 +1246,94 @@ small.mono{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
 
 <section id="logs">
   <h3>Log Aktivitas</h3>
+  <div class="row" style="justify-content:space-between;margin-bottom:10px;">
+    <div class="row">
+      <span>Tampilkan:</span>
+      <select id="logs-per-page" style="width:80px;">
+        <option value="10">10</option>
+        <option value="25" selected>25</option>
+        <option value="50">50</option>
+        <option value="100">100</option>
+      </select>
+      <span>log per halaman</span>
+    </div>
+    <div class="row">
+      <button id="logs-prev" class="secondary">‹ Prev</button>
+      <span id="logs-page-info" style="margin:0 10px;">Halaman 1</span>
+      <button id="logs-next" class="secondary">Next ›</button>
+    </div>
+  </div>
   <table>
     <thead><tr><th>Waktu</th><th>Akun</th><th>Grup</th><th>Status</th><th>Preview</th><th>Error</th></tr></thead>
     <tbody id="logs-tbody"></tbody>
   </table>
+  <div class="row" style="justify-content:center;margin-top:10px;">
+    <small class="mono" id="logs-count-info">0 log</small>
+  </div>
 </section>
 
 <section id="templates">
-  <h3>Template Global</h3>
+  <h3>Template Global (dengan Caption per Media)</h3>
   <div class="row">
     <label for="tpl-name">Nama Template</label>
     <input id="tpl-name" placeholder="Nama template" style="width:200px">
-    <label for="tpl-text">Teks (opsional)</label>
-    <textarea id="tpl-text" placeholder="Teks (opsional)" rows="4" style="width:420px"></textarea>
     <button id="tpl-create">Tambah Template</button>
     <button id="tpl-save" class="secondary" disabled>Simpan Perubahan</button>
+  </div>
+  
+  <!-- Modal for Template Test -->
+  <div id="test-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;">
+    <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:20px;max-width:500px;width:90%;">
+      <h3 style="margin-top:0;">Test Template</h3>
+      <div style="margin:15px 0;">
+        <label for="test-account">Pilih Akun:</label>
+        <select id="test-account" style="width:100%;margin-top:5px;"></select>
+      </div>
+      <div style="margin:15px 0;">
+        <label for="test-group">Pilih Grup:</label>
+        <select id="test-group" style="width:100%;margin-top:5px;"></select>
+      </div>
+      <div class="row" style="margin-top:20px;justify-content:flex-end;">
+        <button id="test-modal-cancel" class="secondary">Batal</button>
+        <button id="test-modal-ok">Kirim Test</button>
+      </div>
+    </div>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <label for="tpl-text-only">Text-Only Message</label>
+    <textarea id="tpl-text-only" placeholder="Pesan text saja (tanpa media)" rows="3" style="width:100%"></textarea>
   </div>
   <div class="row" style="margin-top:8px">
     <label for="file-image">Gambar</label>
     <input type="file" id="file-image" accept="image/*" multiple>
+    <label for="tpl-img-caption">Caption Gambar</label>
+    <textarea id="tpl-img-caption" placeholder="Caption untuk gambar (gunakan {group_name}, {time_now})" rows="2" style="width:300px"></textarea>
+  </div>
+  <div class="row" style="margin-top:8px">
     <label for="file-video">Video</label>
     <input type="file" id="file-video" accept="video/*" multiple>
+    <label for="tpl-vid-caption">Caption Video</label>
+    <textarea id="tpl-vid-caption" placeholder="Caption untuk video" rows="2" style="width:300px"></textarea>
+  </div>
+  <div class="row" style="margin-top:8px">
     <label for="file-audio">Audio/Voice</label>
     <input type="file" id="file-audio" accept="audio/*" multiple>
+    <small class="mono">Audio tidak support caption</small>
+  </div>
+  <div class="row" style="margin-top:8px">
     <label for="file-sticker">Sticker (webp)</label>
     <input type="file" id="file-sticker" accept="image/webp" multiple>
+    <small class="mono">Sticker tidak support caption</small>
+  </div>
+  <div class="row" style="margin-top:8px">
     <label for="file-doc">Dokumen</label>
     <input type="file" id="file-doc" multiple>
+    <label for="tpl-doc-caption">Caption Dokumen</label>
+    <textarea id="tpl-doc-caption" placeholder="Caption untuk dokumen" rows="2" style="width:300px"></textarea>
   </div>
-  <small class="mono">Petunjuk upload: semua file diunggah ke /uploads dan disimpan dalam template ini. Saat broadcast, sistem merotasi template aktif secara acak.</small>
+  <small class="mono">Template baru: Text-only untuk pesan murni teks, atau media dengan caption terpisah. Gunakan {group_name} dan {time_now} untuk personalisasi.</small>
   <table style="margin-top:8px">
-    <thead><tr><th>Nama</th><th>Aktif</th><th>Images</th><th>Videos</th><th>Audio</th><th>Stickers</th><th>Docs</th><th>Aksi</th></tr></thead>
+    <thead><tr><th>Nama</th><th>Aktif</th><th>Text-Only</th><th>Images</th><th>Videos</th><th>Audio</th><th>Stickers</th><th>Docs</th><th>Aksi</th></tr></thead>
     <tbody id="tpl-tbody"></tbody>
   </table>
 </section>
@@ -1161,6 +1348,21 @@ function escapeHtml(s){
   return s.replace(/[&<>"']/g, function(c){
     return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]);
   });
+}
+
+// Direct onclick handler for group actions
+function handleGroupAction(action, groupId) {
+  console.log('🎯 handleGroupAction called - Action:', action, 'Group ID:', groupId);
+  
+  if (action === 'members') {
+    console.log('👥 Calling loadParticipants for group:', groupId);
+    loadParticipants(groupId);
+  } else if (action === 'export') {
+    console.log('📥 Calling exportParticipantsCSV for group:', groupId);
+    exportParticipantsCSV(groupId);
+  } else {
+    console.log('❓ Unknown action:', action);
+  }
 }
 
 async function pollHealth(){
@@ -1219,6 +1421,31 @@ async function loadAccounts(){
       sel3.appendChild(opt3);
     }
   });
+  // Load groups for send-test section after accounts loaded
+  if (sel2 && sel2.value) {
+    await loadSendGroups();
+  }
+}
+
+async function loadSendGroups(){
+  var acc = $('#send-account') ? $('#send-account').value : '';
+  if (!acc) return;
+  var sel = $('#send-group');
+  if (!sel) return;
+  
+  sel.innerHTML = '<option value="">-- Pilih Grup --</option>';
+  try {
+    var r = await api('/api/groups?account_id=' + acc);
+    var list = await r.json();
+    list.forEach(function(g){
+      var opt = document.createElement('option');
+      opt.value = g.id;
+      opt.textContent = g.name || g.id;
+      sel.appendChild(opt);
+    });
+  } catch(e) {
+    console.error('Failed to load groups:', e);
+  }
 }
 
 async function createAccount(){
@@ -1304,8 +1531,8 @@ function rowGroup(g){
     '<td>'+g.risk_score+'</td>'+
     '<td><small class="mono">'+g.id+'</small></td>'+
     '<td>'+
-      '<button class="secondary" data-act="members" data-id="'+g.id+'">Anggota</button> '+
-      '<button class="secondary" data-act="export" data-id="'+g.id+'">Export CSV</button>'+
+      '<button class="secondary" type="button" data-act="members" data-id="'+g.id+'" onclick="handleGroupAction(\'members\', \''+g.id+'\')">Anggota</button> '+
+      '<button class="secondary" type="button" data-act="export" data-id="'+g.id+'" onclick="handleGroupAction(\'export\', \''+g.id+'\')">Export CSV</button>'+
     '</td>';
   return tr;
 }
@@ -1325,12 +1552,18 @@ async function toggleGroup(id, enabled){
 }
 
 function renderParticipants(list){
-  var tb = document.getElementById('participants-tbody'); if(!tb) return;
+  var tb = document.getElementById('participants-tbody'); 
+  if(!tb) return;
+  
   tb.innerHTML = '';
+  
   if (!Array.isArray(list) || list.length === 0) {
     tb.innerHTML = '<tr><td colspan="4"><small class="mono">Tidak ada anggota terdeteksi atau akun belum connect.</small></td></tr>';
+    var info = document.getElementById('participants-info');
+    if (info) info.textContent = 'Tidak ada anggota yang ditemukan';
     return;
   }
+  
   list.forEach(function(p){
     var tr = document.createElement('tr');
     tr.innerHTML =
@@ -1340,31 +1573,196 @@ function renderParticipants(list){
       '<td>'+(p.is_superadmin?'Ya':'-')+'</td>';
     tb.appendChild(tr);
   });
+  
+  // Update info counter
   var info = document.getElementById('participants-info');
   if (info) info.textContent = 'Total anggota: '+list.length;
 }
 
 async function loadParticipants(gid){
+  console.log('🚀 loadParticipants called with gid:', gid);
+  
   try{
     var acc = document.getElementById('groups-account') ? document.getElementById('groups-account').value : '';
-    if(!acc){ alert('Pilih akun'); return; }
-    var r = await api('/api/accounts/'+encodeURIComponent(acc)+'/groups/'+encodeURIComponent(gid)+'/participants');
-    if(!r.ok){ throw new Error(await r.text()); }
+    console.log('📋 Selected account:', acc);
+    
+    if(!acc){ 
+      console.log('❌ No account selected');
+      alert('Pilih akun terlebih dahulu dari dropdown "Grup (per Akun)"'); 
+      return; 
+    }
+    
+    // Show loading state
+    console.log('⏳ Setting loading state...');
+    var tb = document.getElementById('participants-tbody');
+    if(tb) {
+      tb.innerHTML = '<tr><td colspan="4"><small class="mono">Memuat anggota grup...</small></td></tr>';
+      console.log('✅ Loading message displayed in table');
+    }
+    
+    var info = document.getElementById('participants-info');
+    if (info) {
+      info.textContent = 'Memuat daftar anggota grup...';
+      console.log('✅ Loading message displayed in info');
+    }
+    
+    // Properly encode both account ID and group ID for URL
+    var encodedAcc = encodeURIComponent(acc);
+    var encodedGid = encodeURIComponent(gid);
+    
+    console.log('🌐 Making API request to:', '/api/accounts/'+encodedAcc+'/groups/'+encodedGid+'/participants');
+    
+    var r = await api('/api/accounts/'+encodedAcc+'/groups/'+encodedGid+'/participants');
+    
+    console.log('📡 API response status:', r.status, r.ok);
+    
+    if(!r.ok){ 
+      var errorText = await r.text();
+      console.log('❌ API error:', errorText);
+      throw new Error(errorText || 'HTTP ' + r.status); 
+    }
+    
     var list = await r.json();
+    console.log('✅ Participants loaded successfully:', list.length, 'members');
+    
     renderParticipants(list);
+    
     // scroll ke section participants
     var section = document.getElementById('participants');
-    if(section){ window.scrollTo({ top: section.offsetTop - 60, behavior: 'smooth' }); }
+    if(section){ 
+      console.log('📍 Scrolling to participants section');
+      window.scrollTo({ top: section.offsetTop - 60, behavior: 'smooth' }); 
+    }
+    
   }catch(e){
-    alert('Gagal muat anggota: '+e.message);
+    console.error('💥 Error in loadParticipants:', e);
+    var tb = document.getElementById('participants-tbody');
+    if(tb) tb.innerHTML = '<tr><td colspan="4" class="err"><small class="mono">Error: '+escapeHtml(e.message)+'</small></td></tr>';
+    
+    var info = document.getElementById('participants-info');
+    if (info) info.textContent = 'Gagal memuat anggota grup';
+    
+    // More user-friendly error messages
+    var errorMsg = e.message || 'Unknown error';
+    var userMessage = 'Gagal memuat anggota grup: ' + errorMsg;
+    
+    // Add specific guidance based on error type
+    if (errorMsg.includes('timeout')) {
+      userMessage += '\n\n💡 Tips:\n';
+      userMessage += '• Grup mungkin sudah tidak aktif\n';
+      userMessage += '• Coba grup yang lebih aktif\n'; 
+      userMessage += '• Pastikan koneksi internet stabil';
+    } else if (errorMsg.includes('not found')) {
+      userMessage += '\n\n💡 Tips:\n';
+      userMessage += '• Grup mungkin sudah dihapus\n';
+      userMessage += '• Periksa ID grup yang benar';
+    } else if (errorMsg.includes('forbidden')) {
+      userMessage += '\n\n💡 Tips:\n';
+      userMessage += '• Anda mungkin sudah dikeluarkan dari grup\n';
+      userMessage += '• Coba grup lain yang masih aktif';
+    } else {
+      userMessage += '\n\n💡 Troubleshooting:\n';
+      userMessage += '• Pastikan akun connected ke WhatsApp\n';
+      userMessage += '• Refresh halaman dan coba lagi\n';
+      userMessage += '• Pilih grup yang masih aktif';
+    }
+    
+    alert(userMessage);
   }
 }
 
-function exportParticipantsCSV(gid){
+async function exportParticipantsCSV(gid){
+  console.log('📥 exportParticipantsCSV called with gid:', gid);
+  
   var acc = document.getElementById('groups-account') ? document.getElementById('groups-account').value : '';
-  if(!acc){ alert('Pilih akun'); return; }
-  var url = '/api/accounts/'+encodeURIComponent(acc)+'/groups/'+encodeURIComponent(gid)+'/participants.csv';
-  window.open(url, '_blank');
+  console.log('📋 Selected account for export:', acc);
+  
+  if(!acc){ 
+    alert('Pilih akun terlebih dahulu dari dropdown "Grup (per Akun)"'); 
+    return; 
+  }
+  
+  try {
+    // Show loading feedback
+    var originalAlert = alert;
+    var loadingModal = function(msg) {
+      var info = document.getElementById('participants-info');
+      if (info) info.textContent = msg;
+    };
+    
+    loadingModal('📥 Menyiapkan export CSV...');
+    
+    // Properly encode both account ID and group ID for URL
+    var encodedAcc = encodeURIComponent(acc);
+    var encodedGid = encodeURIComponent(gid);
+    
+    var url = '/api/accounts/'+encodedAcc+'/groups/'+encodedGid+'/participants.csv';
+    console.log('🌐 CSV export URL:', url);
+    
+    // Test if the endpoint is accessible first
+    loadingModal('🔍 Memeriksa ketersediaan data...');
+    var testResponse = await fetch(url, { method: 'HEAD' });
+    
+    if (!testResponse.ok) {
+      var errorText = '';
+      try {
+        // Try to get error details
+        var fullResponse = await fetch(url);
+        errorText = await fullResponse.text();
+      } catch(e2) {
+        errorText = 'HTTP ' + testResponse.status;
+      }
+      
+      loadingModal('❌ Export gagal');
+      
+      var userMessage = 'Gagal export CSV: ' + errorText;
+      if (errorText.includes('timeout')) {
+        userMessage += '\n\n💡 Tips:\n';
+        userMessage += '• Grup mungkin sudah tidak aktif\n';
+        userMessage += '• Coba export grup yang lebih kecil\n';
+        userMessage += '• Pastikan koneksi internet stabil';
+      } else if (errorText.includes('not found')) {
+        userMessage += '\n\n💡 Tips:\n';
+        userMessage += '• Grup mungkin sudah dihapus\n';
+        userMessage += '• Periksa ID grup yang benar';
+      }
+      
+      alert(userMessage);
+      return;
+    }
+    
+    // If accessible, proceed with download
+    loadingModal('⬇️ Mengunduh file CSV...');
+    
+    // Create a temporary link to download the file
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'participants_'+gid.replace(/[^a-zA-Z0-9]/g, '_')+'.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    
+    // Success feedback
+    setTimeout(function() {
+      loadingModal('✅ Export berhasil!');
+      console.log('✅ CSV export completed successfully');
+    }, 500);
+    
+    // Reset info after 3 seconds
+    setTimeout(function() {
+      var info = document.getElementById('participants-info');
+      if (info && info.textContent.includes('Export berhasil')) {
+        info.textContent = 'Total anggota: -';
+      }
+    }, 3000);
+    
+  } catch(e) {
+    console.error('💥 Error exporting CSV:', e);
+    var info = document.getElementById('participants-info');
+    if (info) info.textContent = '❌ Export gagal';
+    
+    alert('Gagal export CSV: ' + e.message + '\n\n💡 Coba:\n• Refresh halaman\n• Pilih grup yang aktif\n• Pastikan koneksi stabil');
+  }
 }
 
 async function loadStats(){
@@ -1376,12 +1774,25 @@ async function loadStats(){
 
 async function sendTest(){
   var acc = $('#send-account') ? $('#send-account').value : '';
-  var gid = $('#send-group-id') ? $('#send-group-id').value.trim() : '';
-  var text = $('#send-text') ? $('#send-text').value : '';
-  if(!acc || !gid){
-    alert('Pilih akun dan isi Group JID');
+  var gidDropdown = $('#send-group') ? $('#send-group').value : '';
+  var gidManual = $('#send-group-id') ? $('#send-group-id').value.trim() : '';
+  var gid = gidManual || gidDropdown;
+  var textOnly = $('#send-text-only') ? $('#send-text-only').value : '';
+  
+  // Get caption values
+  var imgCaption = $('#send-img-caption') ? $('#send-img-caption').value : '';
+  var vidCaption = $('#send-vid-caption') ? $('#send-vid-caption').value : '';
+  var docCaption = $('#send-doc-caption') ? $('#send-doc-caption').value : '';
+  
+  if(!acc){
+    alert('Pilih akun terlebih dahulu');
     return;
   }
+  if(!gid){
+    alert('Pilih grup dari dropdown atau isi Group JID secara manual');
+    return;
+  }
+  
   // Upload langsung dari file input, tanpa perlu URL manual
   async function upload(kind, file){
     var fd = new FormData(); fd.append('kind', kind); fd.append('file', file);
@@ -1405,9 +1816,22 @@ async function sendTest(){
     var audios = await collect('audio','send-file-audio');
     var stickers = await collect('sticker','send-file-sticker');
     var docs = await collect('doc','send-file-doc');
+    
     var r = await api('/api/send/test', {
       method:'POST',
-      body: JSON.stringify({account_id: acc, group_id: gid, text: text, image_urls: images, video_urls: videos, audio_urls: audios, sticker_urls: stickers, doc_urls: docs})
+      body: JSON.stringify({
+        account_id: acc, 
+        group_id: gid, 
+        text_only: textOnly,
+        image_urls: images, 
+        image_caption: imgCaption,
+        video_urls: videos, 
+        video_caption: vidCaption,
+        audio_urls: audios, 
+        sticker_urls: stickers, 
+        doc_urls: docs,
+        doc_caption: docCaption
+      })
     });
     if(!r.ok){ throw new Error(await r.text()); }
     await r.json();
@@ -1418,6 +1842,8 @@ async function sendTest(){
 }
 
 function bindEvents(){
+  console.log('🔧 Initializing event handlers...');
+  
   $('#acc-create').addEventListener('click', createAccount);
   var btnSave = document.getElementById('acc-save');
   if (btnSave) btnSave.addEventListener('click', saveAccount);
@@ -1434,21 +1860,73 @@ function bindEvents(){
   });
   $('#btn-refresh').addEventListener('click', refreshGroups);
   $('#groups-account').addEventListener('change', loadGroups);
+  
+  // Send test: load groups when account changes
+  var sendAccSel = $('#send-account');
+  if (sendAccSel) {
+    sendAccSel.addEventListener('change', loadSendGroups);
+  }
+  
+  // Send test: sync group dropdown to manual input
+  var sendGroupSel = $('#send-group');
+  if (sendGroupSel) {
+    sendGroupSel.addEventListener('change', function(){
+      var gidInput = $('#send-group-id');
+      if (gidInput && sendGroupSel.value) {
+        gidInput.value = sendGroupSel.value;
+      }
+    });
+  }
+  
+  // Send test: clear dropdown when manual input is used
+  var sendGidInput = $('#send-group-id');
+  if (sendGidInput) {
+    sendGidInput.addEventListener('input', function(){
+      if (sendGroupSel && sendGidInput.value) {
+        sendGroupSel.value = '';
+      }
+    });
+  }
   $('#groups-tbody').addEventListener('change', function(e){
     var cb = e.target.closest('.g-toggle'); if(!cb) return;
     toggleGroup(cb.getAttribute('data-id'), cb.checked);
   });
-  $('#groups-tbody').addEventListener('click', function(e){
-    var btn = e.target.closest('button'); if(!btn) return;
-    var id = btn.getAttribute('data-id');
-    var act = btn.getAttribute('data-act');
-    if (!id || !act) return;
-    if (act === 'members') {
-      loadParticipants(id);
-    } else if (act === 'export') {
-      exportParticipantsCSV(id);
-    }
-  });
+  
+  // Fix groups-tbody click handler with debug
+  var groupsTbody = document.getElementById('groups-tbody');
+  if (groupsTbody) {
+    console.log('✅ groups-tbody element found, attaching click handler');
+    groupsTbody.addEventListener('click', function(e){
+      console.log('🖱️ Click detected on groups-tbody:', e.target);
+      
+      var btn = e.target.closest('button'); 
+      if(!btn) {
+        console.log('❌ No button found in click target');
+        return;
+      }
+      
+      var id = btn.getAttribute('data-id');
+      var act = btn.getAttribute('data-act');
+      console.log('🔍 Button clicked - ID:', id, 'Action:', act);
+      
+      if (!id || !act) {
+        console.log('❌ Missing ID or action attribute');
+        return;
+      }
+      
+      if (act === 'members') {
+        console.log('👥 Loading participants for group:', id);
+        loadParticipants(id);
+      } else if (act === 'export') {
+        console.log('📥 Exporting CSV for group:', id);
+        exportParticipantsCSV(id);
+      } else {
+        console.log('❓ Unknown action:', act);
+      }
+    });
+  } else {
+    console.error('❌ groups-tbody element not found!');
+  }
   var groupsContainer = document.getElementById('groups-container');
   if (groupsContainer) {
     groupsContainer.addEventListener('change', function(e){
@@ -1483,6 +1961,60 @@ function bindEvents(){
   if (btnTpl) btnTpl.addEventListener('click', createTemplate);
   var btnTplSave = document.getElementById('tpl-save');
   if (btnTplSave) btnTplSave.addEventListener('click', saveTemplate);
+  
+  // Template test modal event listeners
+  var testAccountSel = $('#test-account');
+  if (testAccountSel) {
+    testAccountSel.addEventListener('change', loadTestGroups);
+  }
+  
+  var testModalOk = $('#test-modal-ok');
+  if (testModalOk) {
+    testModalOk.addEventListener('click', sendTestTemplate);
+  }
+  
+  var testModalCancel = $('#test-modal-cancel');
+  if (testModalCancel) {
+    testModalCancel.addEventListener('click', function(){
+      var modal = $('#test-modal');
+      if (modal) modal.style.display = 'none';
+    });
+  }
+  
+  // Close modal when clicking outside
+  var testModal = $('#test-modal');
+  if (testModal) {
+    testModal.addEventListener('click', function(e){
+      if (e.target === testModal) {
+        testModal.style.display = 'none';
+      }
+    });
+  }
+  
+  // Logs pagination event listeners
+  var logsPrev = $('#logs-prev');
+  if (logsPrev) {
+    logsPrev.addEventListener('click', function(){
+      goToLogsPage(currentPage - 1);
+    });
+  }
+  
+  var logsNext = $('#logs-next');
+  if (logsNext) {
+    logsNext.addEventListener('click', function(){
+      goToLogsPage(currentPage + 1);
+    });
+  }
+  
+  var logsPerPageSel = $('#logs-per-page');
+  if (logsPerPageSel) {
+    logsPerPageSel.addEventListener('change', function(){
+      logsPerPage = parseInt(this.value) || 25;
+      currentPage = 1;
+      renderLogsPage();
+      updateLogsInfo();
+    });
+  }
 }
 
 function rowLog(l){
@@ -1499,21 +2031,88 @@ function rowLog(l){
 }
 
 var esLogs = null;
+var allLogs = [];
+var currentPage = 1;
+var logsPerPage = 25;
+
 function logsConnect(){
   try{
     esLogs = new EventSource('/api/logs/stream');
     esLogs.onmessage = function(ev){
       try{
         var l = JSON.parse(ev.data);
-        var tb = document.getElementById('logs-tbody');
-        if(tb){
-          var tr = rowLog(l);
-          if (tb.firstChild) tb.insertBefore(tr, tb.firstChild);
-          else tb.appendChild(tr);
+        
+        // Add to beginning of allLogs array
+        allLogs.unshift(l);
+        
+        // Keep only last 500 logs in memory
+        if(allLogs.length > 500) {
+          allLogs = allLogs.slice(0, 500);
         }
+        
+        // If we're on page 1, refresh the display
+        if(currentPage === 1) {
+          renderLogsPage();
+        }
+        
+        updateLogsInfo();
       }catch(e){}
     };
   }catch(e){}
+}
+
+function renderLogsPage(){
+  var tb = document.getElementById('logs-tbody');
+  if(!tb) return;
+  
+  tb.innerHTML = '';
+  
+  var start = (currentPage - 1) * logsPerPage;
+  var end = start + logsPerPage;
+  var pageLogs = allLogs.slice(start, end);
+  
+  pageLogs.forEach(function(l){
+    var tr = rowLog(l);
+    tb.appendChild(tr);
+  });
+}
+
+function updateLogsInfo(){
+  var totalPages = Math.ceil(allLogs.length / logsPerPage);
+  if(totalPages < 1) totalPages = 1;
+  
+  var pageInfo = document.getElementById('logs-page-info');
+  if(pageInfo) {
+    pageInfo.textContent = 'Halaman ' + currentPage + ' dari ' + totalPages;
+  }
+  
+  var countInfo = document.getElementById('logs-count-info');
+  if(countInfo) {
+    var start = (currentPage - 1) * logsPerPage + 1;
+    var end = Math.min(currentPage * logsPerPage, allLogs.length);
+    if(allLogs.length === 0) {
+      countInfo.textContent = '0 log';
+    } else {
+      countInfo.textContent = 'Menampilkan ' + start + '-' + end + ' dari ' + allLogs.length + ' log';
+    }
+  }
+  
+  var prevBtn = document.getElementById('logs-prev');
+  var nextBtn = document.getElementById('logs-next');
+  if(prevBtn) prevBtn.disabled = currentPage <= 1;
+  if(nextBtn) nextBtn.disabled = currentPage >= totalPages;
+}
+
+function goToLogsPage(page){
+  var totalPages = Math.ceil(allLogs.length / logsPerPage);
+  if(totalPages < 1) totalPages = 1;
+  
+  if(page < 1) page = 1;
+  if(page > totalPages) page = totalPages;
+  
+  currentPage = page;
+  renderLogsPage();
+  updateLogsInfo();
 }
 
 function renderAccountCard(acc){
@@ -1584,9 +2183,12 @@ async function loadGroupsByNumber(){
 }
 function rowTemplate(t){
   var tr = document.createElement('tr');
+  var textOnlyPreview = (t.text_only && t.text_only.trim()) ? 
+    '<span title="'+escapeHtml(t.text_only)+'">✓ Text</span>' : '-';
   tr.innerHTML =
     '<td>'+escapeHtml(t.name)+'</td>'+
     '<td><input type="checkbox" data-id="'+t.id+'" class="tpl-toggle" '+(t.enabled?'checked':'')+'></td>'+
+    '<td>'+textOnlyPreview+'</td>'+
     '<td>'+(t.image_urls||[]).length+'</td>'+
     '<td>'+(t.video_urls||[]).length+'</td>'+
     '<td>'+(t.audio_urls||[]).length+'</td>'+
@@ -1594,6 +2196,7 @@ function rowTemplate(t){
     '<td>'+(t.doc_urls||[]).length+'</td>'+
     '<td>'+
       '<button class="secondary" data-act="edit" data-id="'+t.id+'">Edit</button> '+
+      '<button class="secondary" data-act="test" data-id="'+t.id+'">Test</button> '+
       '<button class="danger" data-act="delete" data-id="'+t.id+'">Delete</button>'+
     '</td>';
   return tr;
@@ -1616,6 +2219,8 @@ async function loadTemplates(){
     if (!id || !act) return;
     if (act === 'edit') {
       startEditTemplate(id);
+    } else if (act === 'test') {
+      testTemplate(id);
     } else if (act === 'delete') {
       deleteTemplate(id);
     }
@@ -1623,9 +2228,13 @@ async function loadTemplates(){
 }
 async function createTemplate(){
   var name = document.getElementById('tpl-name').value.trim();
-  var txtEl = document.getElementById('tpl-text');
-  var text = txtEl ? txtEl.value : '';
+  var textOnly = document.getElementById('tpl-text-only') ? document.getElementById('tpl-text-only').value : '';
+  var imgCaption = document.getElementById('tpl-img-caption') ? document.getElementById('tpl-img-caption').value : '';
+  var vidCaption = document.getElementById('tpl-vid-caption') ? document.getElementById('tpl-vid-caption').value : '';
+  var docCaption = document.getElementById('tpl-doc-caption') ? document.getElementById('tpl-doc-caption').value : '';
+  
   if(!name){ alert('Nama template wajib'); return; }
+  
   async function upload(kind, file){
     var fd = new FormData(); fd.append('kind', kind); fd.append('file', file);
     var r = await fetch('/api/upload', { method:'POST', body: fd });
@@ -1648,8 +2257,38 @@ async function createTemplate(){
     var auds = await collect('audio','file-audio');
     var sts  = await collect('sticker','file-sticker');
     var docs = await collect('doc','file-doc');
-    var r = await api('/api/templates', { method:'POST', body: JSON.stringify({ name: name, text: text, image_urls: imgs, video_urls: vids, audio_urls: auds, sticker_urls: sts, doc_urls: docs, enabled: true }) });
+    
+    var r = await api('/api/templates', { 
+      method:'POST', 
+      body: JSON.stringify({ 
+        name: name, 
+        text_only: textOnly,
+        image_urls: imgs, 
+        image_caption: imgCaption,
+        video_urls: vids, 
+        video_caption: vidCaption,
+        audio_urls: auds, 
+        sticker_urls: sts, 
+        doc_urls: docs,
+        doc_caption: docCaption,
+        enabled: true 
+      }) 
+    });
     if(!r.ok){ throw new Error(await r.text()); }
+    
+    // Clear form inputs after successful creation
+    document.getElementById('tpl-name').value = '';
+    if (document.getElementById('tpl-text-only')) document.getElementById('tpl-text-only').value = '';
+    if (document.getElementById('tpl-img-caption')) document.getElementById('tpl-img-caption').value = '';
+    if (document.getElementById('tpl-vid-caption')) document.getElementById('tpl-vid-caption').value = '';
+    if (document.getElementById('tpl-doc-caption')) document.getElementById('tpl-doc-caption').value = '';
+    
+    var fileInputs = ['file-image','file-video','file-audio','file-sticker','file-doc'];
+    fileInputs.forEach(function(id){
+      var el = document.getElementById(id);
+      if(el) el.value = '';
+    });
+    
     await loadTemplates();
     alert('Template dibuat');
   }catch(e){
@@ -1661,12 +2300,24 @@ async function createTemplate(){
 function startEditTemplate(id){
   var t = tplById[id];
   if (!t) { alert('Template tidak ditemukan'); return; }
+  
   var nameEl = document.getElementById('tpl-name');
-  var textEl = document.getElementById('tpl-text');
+  var textOnlyEl = document.getElementById('tpl-text-only');
+  var imgCaptionEl = document.getElementById('tpl-img-caption');
+  var vidCaptionEl = document.getElementById('tpl-vid-caption');
+  var docCaptionEl = document.getElementById('tpl-doc-caption');
+  
   if (nameEl) nameEl.value = t.name || '';
-  if (textEl) textEl.value = t.text || '';
-  var btnSave = document.getElementById('tpl-save'); if (btnSave) btnSave.disabled = false;
+  if (textOnlyEl) textOnlyEl.value = t.text_only || '';
+  if (imgCaptionEl) imgCaptionEl.value = t.image_caption || '';
+  if (vidCaptionEl) vidCaptionEl.value = t.video_caption || '';
+  if (docCaptionEl) docCaptionEl.value = t.doc_caption || '';
+  
+  var btnSave = document.getElementById('tpl-save'); 
+  if (btnSave) btnSave.disabled = false;
+  
   editingTemplateId = id;
+  
   var section = document.getElementById('templates');
   if (section) { window.scrollTo({ top: section.offsetTop - 60, behavior: 'smooth' }); }
 }
@@ -1675,8 +2326,13 @@ async function saveTemplate(){
     if(!editingTemplateId){ alert('Tidak ada template yang sedang diedit'); return; }
     var t = tplById[editingTemplateId] || {};
     var name = document.getElementById('tpl-name') ? document.getElementById('tpl-name').value.trim() : '';
-    var text = document.getElementById('tpl-text') ? document.getElementById('tpl-text').value : '';
+    var textOnly = document.getElementById('tpl-text-only') ? document.getElementById('tpl-text-only').value : '';
+    var imgCaption = document.getElementById('tpl-img-caption') ? document.getElementById('tpl-img-caption').value : '';
+    var vidCaption = document.getElementById('tpl-vid-caption') ? document.getElementById('tpl-vid-caption').value : '';
+    var docCaption = document.getElementById('tpl-doc-caption') ? document.getElementById('tpl-doc-caption').value : '';
+    
     if(!name){ alert('Nama wajib'); return; }
+    
     async function upload(kind, file){
       var fd = new FormData(); fd.append('kind', kind); fd.append('file', file);
       var r = await fetch('/api/upload', { method:'POST', body: fd });
@@ -1693,34 +2349,157 @@ async function saveTemplate(){
       }
       return urls;
     }
+    
     var imgsNew = await collect('image','file-image');
     var vidsNew = await collect('video','file-video');
     var audsNew = await collect('audio','file-audio');
     var stsNew  = await collect('sticker','file-sticker');
     var docsNew = await collect('doc','file-doc');
+    
     var body = {
       name: name,
-      text: text,
+      text_only: textOnly,
       image_urls: (t.image_urls||[]).concat(imgsNew||[]),
+      image_caption: imgCaption,
       video_urls: (t.video_urls||[]).concat(vidsNew||[]),
+      video_caption: vidCaption,
       audio_urls: (t.audio_urls||[]).concat(audsNew||[]),
       sticker_urls: (t.sticker_urls||[]).concat(stsNew||[]),
       doc_urls: (t.doc_urls||[]).concat(docsNew||[]),
+      doc_caption: docCaption,
       enabled: !!t.enabled
     };
+    
     var r = await api('/api/templates/'+encodeURIComponent(editingTemplateId), { method:'PUT', body: JSON.stringify(body) });
     if(!r.ok){ throw new Error(await r.text()); }
+    
     // reset state & clear file inputs
     editingTemplateId = null;
     var btnSave = document.getElementById('tpl-save'); if (btnSave) btnSave.disabled = true;
     var ids = ['file-image','file-video','file-audio','file-sticker','file-doc'];
     for(var i=0;i<ids.length;i++){ var el = document.getElementById(ids[i]); if(el){ el.value=''; } }
+    
     await loadTemplates();
     alert('Template diupdate');
   }catch(e){
     alert('Gagal update template: '+e.message);
   }
 }
+var currentTestTemplateId = null;
+
+async function testTemplate(id){
+  try{
+    var t = tplById[id];
+    if (!t) { alert('Template tidak ditemukan'); return; }
+    
+    // Get list of accounts
+    var accounts = Object.values(accById);
+    if (accounts.length === 0) {
+      alert('Tidak ada akun tersedia. Tambahkan akun terlebih dahulu.');
+      return;
+    }
+    
+    // Store current template ID
+    currentTestTemplateId = id;
+    
+    // Populate account dropdown
+    var accSelect = $('#test-account');
+    accSelect.innerHTML = '<option value="">-- Pilih Akun --</option>';
+    accounts.forEach(function(a){
+      var opt = document.createElement('option');
+      opt.value = a.id;
+      opt.textContent = a.label + ' (' + (a.msisdn || '-') + ')';
+      accSelect.appendChild(opt);
+    });
+    
+    // Clear group dropdown
+    var grpSelect = $('#test-group');
+    grpSelect.innerHTML = '<option value="">-- Pilih Akun Terlebih Dahulu --</option>';
+    
+    // Show modal
+    var modal = $('#test-modal');
+    modal.style.display = 'flex';
+  }catch(err){
+    alert('Gagal membuka dialog test: '+err.message);
+  }
+}
+
+async function loadTestGroups(){
+  var accSelect = $('#test-account');
+  var grpSelect = $('#test-group');
+  var accId = accSelect.value;
+  
+  if (!accId) {
+    grpSelect.innerHTML = '<option value="">-- Pilih Akun Terlebih Dahulu --</option>';
+    return;
+  }
+  
+  grpSelect.innerHTML = '<option value="">Loading...</option>';
+  
+  try {
+    var r = await api('/api/groups?account_id=' + accId);
+    if (r.ok) {
+      var groups = await r.json();
+      grpSelect.innerHTML = '<option value="">-- Pilih Grup --</option>';
+      groups.forEach(function(g){
+        var opt = document.createElement('option');
+        opt.value = g.id;
+        opt.textContent = g.name || g.id;
+        grpSelect.appendChild(opt);
+      });
+    } else {
+      grpSelect.innerHTML = '<option value="">Gagal load grup</option>';
+    }
+  } catch(e) {
+    console.error('Failed to load groups:', e);
+    grpSelect.innerHTML = '<option value="">Error loading groups</option>';
+  }
+}
+
+async function sendTestTemplate(){
+  try{
+    var t = tplById[currentTestTemplateId];
+    if (!t) { alert('Template tidak ditemukan'); return; }
+    
+    var acc = $('#test-account').value;
+    var gid = $('#test-group').value;
+    
+    if (!acc) {
+      alert('Pilih akun terlebih dahulu');
+      return;
+    }
+    if (!gid) {
+      alert('Pilih grup terlebih dahulu');
+      return;
+    }
+    
+    // Close modal
+    $('#test-modal').style.display = 'none';
+    
+    var r = await api('/api/send/test', {
+      method:'POST',
+      body: JSON.stringify({
+        account_id: acc, 
+        group_id: gid, 
+        text_only: t.text_only || '',
+        image_urls: t.image_urls || [], 
+        image_caption: t.image_caption || '',
+        video_urls: t.video_urls || [], 
+        video_caption: t.video_caption || '',
+        audio_urls: t.audio_urls || [], 
+        sticker_urls: t.sticker_urls || [], 
+        doc_urls: t.doc_urls || [],
+        doc_caption: t.doc_caption || ''
+      })
+    });
+    if(!r.ok){ throw new Error(await r.text()); }
+    await r.json();
+    alert('Template "'+t.name+'" sedang dikirim untuk testing');
+  }catch(err){
+    alert('Gagal test template: '+err.message);
+  }
+}
+
 async function deleteTemplate(id){
   try{
     if(!id) return;

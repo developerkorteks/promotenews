@@ -99,6 +99,7 @@ func migrate(db *sql.DB) error {
 			account_id TEXT,
 			group_id TEXT,
 			campaign_id TEXT,
+			campaign_session_id TEXT,
 			status TEXT,
 			error TEXT,
 			message_preview TEXT,
@@ -111,11 +112,14 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS templates (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
-			text TEXT,
+			text_only TEXT,
 			images_json TEXT,
+			images_caption TEXT,
 			videos_json TEXT,
+			videos_caption TEXT,
 			stickers_json TEXT,
 			docs_json TEXT,
+			docs_caption TEXT,
 			audio_json TEXT,
 			enabled INTEGER NOT NULL DEFAULT 1,
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -134,6 +138,39 @@ func migrate(db *sql.DB) error {
 	}
 	// Best-effort schema upgrade for existing installations: add audio_json if missing.
 	_, _ = tx.Exec(`ALTER TABLE templates ADD COLUMN audio_json TEXT;`)
+	// Add campaign_session_id column if missing
+	_, _ = tx.Exec(`ALTER TABLE logs ADD COLUMN campaign_session_id TEXT;`)
+	
+	// Migrate from old schema to new caption-per-media schema
+	_, _ = tx.Exec(`ALTER TABLE templates ADD COLUMN text_only TEXT;`)
+	_, _ = tx.Exec(`ALTER TABLE templates ADD COLUMN images_caption TEXT;`)
+	_, _ = tx.Exec(`ALTER TABLE templates ADD COLUMN videos_caption TEXT;`)
+	_, _ = tx.Exec(`ALTER TABLE templates ADD COLUMN docs_caption TEXT;`)
+	
+	// Create group_participants cache table for fast retrieval
+	_, _ = tx.Exec(`CREATE TABLE IF NOT EXISTS group_participants (
+		group_id TEXT NOT NULL,
+		jid TEXT NOT NULL,
+		number TEXT NOT NULL,
+		is_admin INTEGER NOT NULL DEFAULT 0,
+		is_superadmin INTEGER NOT NULL DEFAULT 0,
+		cached_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (group_id, jid),
+		FOREIGN KEY(group_id) REFERENCES groups(id) ON DELETE CASCADE
+	)`)
+	_, _ = tx.Exec(`CREATE INDEX IF NOT EXISTS idx_group_participants_group ON group_participants(group_id);`)
+	_, _ = tx.Exec(`CREATE INDEX IF NOT EXISTS idx_group_participants_cached ON group_participants(group_id, cached_at);`)
+	
+	// Migrate existing 'text' column to appropriate caption columns for backward compatibility
+	_, _ = tx.Exec(`UPDATE templates SET 
+		text_only = text,
+		images_caption = CASE WHEN images_json IS NOT NULL AND images_json != '[]' THEN text ELSE NULL END,
+		videos_caption = CASE WHEN videos_json IS NOT NULL AND videos_json != '[]' THEN text ELSE NULL END,
+		docs_caption = CASE WHEN docs_json IS NOT NULL AND docs_json != '[]' THEN text ELSE NULL END
+		WHERE text_only IS NULL`)
+	
+	// Remove old text column after migration (optional, commented for safety)
+	// _, _ = tx.Exec(`ALTER TABLE templates DROP COLUMN text;`)
 	return tx.Commit()
 }
 
@@ -278,5 +315,96 @@ func (s *Store) UpdateAccount(id, label, msisdn string, enabled bool, dailyLimit
 // DeleteAccount menghapus akun. Relasi groups akan ikut terhapus karena ON DELETE CASCADE.
 func (s *Store) DeleteAccount(id string) error {
 	_, err := s.DB.Exec(`DELETE FROM accounts WHERE id=?`, id)
+	return err
+}
+
+// CacheGroupParticipants menyimpan/update daftar participants grup ke cache database
+func (s *Store) CacheGroupParticipants(groupID string, participants []struct {
+	JID          string
+	Number       string
+	IsAdmin      bool
+	IsSuperAdmin bool
+}) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Hapus cache lama untuk grup ini
+	if _, err := tx.Exec(`DELETE FROM group_participants WHERE group_id=?`, groupID); err != nil {
+		return err
+	}
+
+	// Insert participants baru
+	stmt, err := tx.Prepare(`INSERT INTO group_participants (group_id, jid, number, is_admin, is_superadmin, cached_at) 
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, p := range participants {
+		if _, err := stmt.Exec(groupID, p.JID, p.Number, btoi(p.IsAdmin), btoi(p.IsSuperAdmin)); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetCachedGroupParticipants mengambil participants dari cache jika ada dan masih valid
+func (s *Store) GetCachedGroupParticipants(groupID string, maxAgeMinutes int) ([]struct {
+	JID          string
+	Number       string
+	IsAdmin      bool
+	IsSuperAdmin bool
+}, bool, error) {
+	// Cek apakah ada cache yang valid
+	var count int
+	err := s.DB.QueryRow(`SELECT COUNT(*) FROM group_participants 
+		WHERE group_id=? AND cached_at > datetime('now', '-' || ? || ' minutes')`,
+		groupID, maxAgeMinutes).Scan(&count)
+	if err != nil || count == 0 {
+		return nil, false, err
+	}
+
+	// Ambil dari cache
+	rows, err := s.DB.Query(`SELECT jid, number, is_admin, is_superadmin 
+		FROM group_participants WHERE group_id=? ORDER BY number`, groupID)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+
+	var participants []struct {
+		JID          string
+		Number       string
+		IsAdmin      bool
+		IsSuperAdmin bool
+	}
+
+	for rows.Next() {
+		var p struct {
+			JID          string
+			Number       string
+			IsAdmin      bool
+			IsSuperAdmin bool
+		}
+		var isAdmin, isSuperAdmin int
+		if err := rows.Scan(&p.JID, &p.Number, &isAdmin, &isSuperAdmin); err != nil {
+			return nil, false, err
+		}
+		p.IsAdmin = isAdmin == 1
+		p.IsSuperAdmin = isSuperAdmin == 1
+		participants = append(participants, p)
+	}
+
+	return participants, true, nil
+}
+
+// InvalidateGroupParticipantsCache menghapus cache participants untuk grup tertentu
+func (s *Store) InvalidateGroupParticipantsCache(groupID string) error {
+	_, err := s.DB.Exec(`DELETE FROM group_participants WHERE group_id=?`, groupID)
 	return err
 }

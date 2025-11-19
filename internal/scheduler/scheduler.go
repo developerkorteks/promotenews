@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"promote/internal/sender"
@@ -41,6 +42,8 @@ type Scheduler struct {
 	riskThreshold int
 	// Override agar inWindow selalu true (uji/ops): SCHEDULER_ALWAYS_ON=1|true|yes
 	alwaysOn bool
+	// Mutex untuk mencegah race condition
+	processMutex sync.Mutex
 }
 
 // New membuat instance Scheduler dengan konfigurasi default konservatif.
@@ -178,6 +181,9 @@ func (s *Scheduler) loop(ctx context.Context) {
 // lalu memilih satu grup yang memenuhi syarat, kemudian kirim menggunakan template acak.
 // Setelah kirim, jeda random 45–120 detik agar natural.
 func (s *Scheduler) processOneSend(ctx context.Context, now time.Time) error {
+	// Lock untuk mencegah multiple execution bersamaan
+	s.processMutex.Lock()
+	defer s.processMutex.Unlock()
 	// 1) Ambil akun aktif (enabled)
 	accs, err := s.listEnabledAccounts()
 	if err != nil {
@@ -222,17 +228,18 @@ func (s *Scheduler) processOneSend(ctx context.Context, now time.Time) error {
 		}
 
 		// 3) Pilih grup satu yang eligible untuk dikirim sekarang
+		log.Printf("[scheduler] SELECTING_GROUP account=%s cooldown=%dh risk_threshold=%d", a.ID, s.cooldownHr, s.riskThreshold)
 		groupID, err := s.pickOneEligibleGroup(a.ID, s.cooldownHr, s.riskThreshold)
 		if err != nil {
-			log.Printf("[scheduler] account=%s pick-group-err=%v", a.ID, err)
+			log.Printf("[scheduler] PICK_GROUP_ERROR account=%s err=%v", a.ID, err)
 			continue
 		}
 		if groupID == "" {
 			// tidak ada grup eligible di akun ini saat ini, lanjut akun lain
-			log.Printf("[scheduler] account=%s pick-group=none", a.ID)
+			log.Printf("[scheduler] NO_ELIGIBLE_GROUPS account=%s", a.ID)
 			continue
 		}
-		log.Printf("[scheduler] account=%s group=%s -> sending with random template...", a.ID, groupID)
+		log.Printf("[scheduler] SELECTED_GROUP account=%s group=%s -> sending with random template...", a.ID, groupID)
 
 		// 4) Kirim menggunakan template acak (sender sudah tangani pacing antar bagian)
 		sendCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
@@ -368,31 +375,52 @@ func (s *Scheduler) countEligibleGroups(accountID string, cooldownHours int, ris
 }
 
 func (s *Scheduler) pickOneEligibleGroup(accountID string, cooldownHours int, riskThreshold int) (string, error) {
-	// Ambil satu grup yang:
-	// - enabled=1
-	// - last_sent_at lebih lama dari cooldownHours atau NULL
-	// - risk_score < threshold
-	// - random
+	// Atomic selection: Update last_sent_at dan return ID dalam satu query
+	// untuk mencegah grup yang sama dipilih bersamaan
 	var (
 		id sql.NullString
 	)
-	err := s.Store.DB.QueryRow(`
+	
+	// Gunakan transaction untuk atomic operation
+	tx, err := s.Store.DB.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	
+	// Ambil grup eligible dengan lock
+	err = tx.QueryRow(`
 		SELECT id
 		FROM groups
 		WHERE account_id=? AND enabled=1 AND (last_sent_at IS NULL OR last_sent_at < datetime('now', ?)) AND risk_score < ?
 		ORDER BY RANDOM()
 		LIMIT 1
 	`, accountID, "-"+itoa(cooldownHours)+" hours", riskThreshold).Scan(&id)
+	
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return "", nil
 		}
 		return "", err
 	}
-	if id.Valid {
-		return id.String, nil
+	
+	if !id.Valid {
+		return "", nil
 	}
-	return "", nil
+	
+	// Update last_sent_at secara atomic untuk reserve grup ini
+	_, err = tx.Exec(`UPDATE groups SET last_sent_at=CURRENT_TIMESTAMP WHERE id=?`, id.String)
+	if err != nil {
+		return "", err
+	}
+	
+	// Commit transaction
+	err = tx.Commit()
+	if err != nil {
+		return "", err
+	}
+	
+	return id.String, nil
 }
 
 func itoa(i int) string {

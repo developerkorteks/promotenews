@@ -396,6 +396,7 @@ func (m *Manager) FetchAndSyncGroups(ctx context.Context, accountID string) (int
 
 // GetGroupParticipants mengambil daftar anggota (user) pada sebuah grup untuk akun tertentu.
 // Mengembalikan slice berisi JID, nomor (user), dan flag admin.
+// Menggunakan strategi cache-first untuk response cepat, dengan fallback ke network request.
 func (m *Manager) GetGroupParticipants(ctx context.Context, accountID, groupJID string) ([]ParticipantInfo, error) {
 	client, err := m.ensureClient(accountID)
 	if err != nil {
@@ -410,28 +411,118 @@ func (m *Manager) GetGroupParticipants(ctx context.Context, accountID, groupJID 
 		return nil, fmt.Errorf("parse JID: %w", err)
 	}
 
-	// Pastikan terkoneksi; toleransi error "already connected"
-	if err := client.Connect(); err != nil {
-		if !strings.Contains(strings.ToLower(err.Error()), "already") {
-			return nil, err
-		}
+	// Strategy 1: Check database cache first (very fast, no network needed)
+	// Cache valid for 24 hours (1440 minutes) - adjust as needed
+	participants, err := m.getCachedParticipants(ctx, groupJID)
+	if err == nil && len(participants) > 0 {
+		m.ClientLogger.Infof("participants: using cache for group %s (%d members)", groupJID, len(participants))
+		return participants, nil
 	}
 
-	// Ambil info grup dari WhatsApp
-	ctx2, cancel := context.WithTimeout(ctx, 85*time.Second)
-	defer cancel()
-	info, err := client.GetGroupInfo(ctx2, jid)
+	// Strategy 2: Cache miss or expired, fetch from WhatsApp
+	// Check if already connected to avoid unnecessary reconnection
+	if !client.IsConnected() {
+		m.ClientLogger.Infof("participants: connecting client for account %s", accountID)
+		if err := client.Connect(); err != nil {
+			return nil, fmt.Errorf("failed to connect: %w", err)
+		}
+		
+		// Wait for connection to stabilize before making queries
+		select {
+		case <-time.After(3 * time.Second):
+			m.ClientLogger.Infof("participants: connection established for account %s", accountID)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	} else {
+		m.ClientLogger.Infof("participants: already connected for account %s", accountID)
+	}
+
+	// Try lightweight method dengan timeout pendek untuk response cepat
+	participants, err = m.fetchAndCacheParticipants(ctx, client, jid, groupJID)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]ParticipantInfo, 0, len(info.Participants))
+
+	return participants, nil
+}
+
+// getCachedParticipants mengambil participants dari database cache
+func (m *Manager) getCachedParticipants(ctx context.Context, groupJID string) ([]ParticipantInfo, error) {
+	// Cache valid for 24 hours (1440 minutes)
+	cached, found, err := m.Store.GetCachedGroupParticipants(groupJID, 1440)
+	if err != nil || !found {
+		return nil, fmt.Errorf("cache miss or error")
+	}
+
+	// Convert to ParticipantInfo
+	participants := make([]ParticipantInfo, 0, len(cached))
+	for _, p := range cached {
+		participants = append(participants, ParticipantInfo{
+			JID:          p.JID,
+			Number:       p.Number,
+			IsAdmin:      p.IsAdmin,
+			IsSuperAdmin: p.IsSuperAdmin,
+		})
+	}
+
+	return participants, nil
+}
+
+// fetchAndCacheParticipants fetches participants from WhatsApp and caches them
+func (m *Manager) fetchAndCacheParticipants(ctx context.Context, client *whatsmeow.Client, jid types.JID, groupJID string) ([]ParticipantInfo, error) {
+	m.ClientLogger.Infof("participants: fetching from WhatsApp for group %s", groupJID)
+	
+	// Use longer timeout for initial testing (30 seconds) - can be reduced after testing
+	ctx2, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	
+	info, err := client.GetGroupInfo(ctx2, jid)
+	if err != nil {
+		// Check for specific errors and provide helpful messages
+		errMsg := err.Error()
+		if strings.Contains(strings.ToLower(errMsg), "timeout") {
+			return nil, fmt.Errorf("grup tidak dapat diakses (timeout) - mungkin grup sudah tidak aktif atau Anda bukan anggota")
+		} else if strings.Contains(strings.ToLower(errMsg), "not found") {
+			return nil, fmt.Errorf("grup tidak ditemukan - mungkin grup sudah dihapus atau ID salah")
+		} else if strings.Contains(strings.ToLower(errMsg), "forbidden") {
+			return nil, fmt.Errorf("tidak ada akses ke grup - mungkin Anda sudah dikeluarkan dari grup")
+		}
+		return nil, fmt.Errorf("gagal mengambil info grup: %v", err)
+	}
+	
+	// Convert to ParticipantInfo
+	participants := make([]ParticipantInfo, 0, len(info.Participants))
 	for _, p := range info.Participants {
-		out = append(out, ParticipantInfo{
+		participants = append(participants, ParticipantInfo{
 			JID:          p.JID.String(),
 			Number:       p.JID.User,
 			IsAdmin:      p.IsAdmin,
 			IsSuperAdmin: p.IsSuperAdmin,
 		})
 	}
-	return out, nil
+	
+	// Cache the results for next time
+	cacheData := make([]struct {
+		JID          string
+		Number       string
+		IsAdmin      bool
+		IsSuperAdmin bool
+	}, len(participants))
+	
+	for i, p := range participants {
+		cacheData[i].JID = p.JID
+		cacheData[i].Number = p.Number
+		cacheData[i].IsAdmin = p.IsAdmin
+		cacheData[i].IsSuperAdmin = p.IsSuperAdmin
+	}
+	
+	// Best effort cache save - don't fail if caching fails
+	if err := m.Store.CacheGroupParticipants(groupJID, cacheData); err != nil {
+		m.ClientLogger.Errorf("participants: failed to cache for group %s: %v", groupJID, err)
+	} else {
+		m.ClientLogger.Infof("participants: cached %d members for group %s", len(participants), groupJID)
+	}
+	
+	return participants, nil
 }
