@@ -20,6 +20,9 @@ import (
 	"promote/internal/storage"
 )
 
+// MessageHandler is a callback for handling incoming messages
+type MessageHandler func(accountID string, evt *events.Message)
+
 type Manager struct {
 	Container     *sqlstore.Container
 	Clients       map[string]*whatsmeow.Client
@@ -33,6 +36,10 @@ type Manager struct {
 	// Multi-session isolation: satu sqlstore container per account
 	BaseDSN    string
 	Containers map[string]*sqlstore.Container
+	
+	// Message handlers (e.g., for auto-join)
+	messageHandlers []MessageHandler
+	handlerMu       sync.RWMutex
 }
 
 var ErrPairingByNumberUnsupported = errors.New("pairing via phone number unsupported by current whatsmeow")
@@ -130,7 +137,7 @@ func (m *Manager) ensureClient(accountID string) (*whatsmeow.Client, error) {
 
 	// Update account status according to events
 	client.AddEventHandler(func(evt interface{}) {
-		switch evt.(type) {
+		switch e := evt.(type) {
 		case *events.Connected:
 			// best effort: update msisdn if available from store ID
 			var msisdn *string
@@ -143,6 +150,9 @@ func (m *Manager) ensureClient(accountID string) (*whatsmeow.Client, error) {
 			_ = m.Store.UpdateAccountStatus(accountID, "logged_out", "", nil)
 		case *events.StreamReplaced:
 			_ = m.Store.UpdateAccountStatus(accountID, "replaced", "", nil)
+		case *events.Message:
+			// Dispatch to message handlers (e.g., auto-join)
+			m.dispatchMessage(accountID, e)
 		}
 	})
 
@@ -525,4 +535,31 @@ func (m *Manager) fetchAndCacheParticipants(ctx context.Context, client *whatsme
 	}
 	
 	return participants, nil
+}
+
+// AddMessageHandler registers a handler for incoming messages
+func (m *Manager) AddMessageHandler(handler MessageHandler) {
+	m.handlerMu.Lock()
+	defer m.handlerMu.Unlock()
+	m.messageHandlers = append(m.messageHandlers, handler)
+}
+
+// dispatchMessage calls all registered message handlers
+func (m *Manager) dispatchMessage(accountID string, evt *events.Message) {
+	m.handlerMu.RLock()
+	handlers := make([]MessageHandler, len(m.messageHandlers))
+	copy(handlers, m.messageHandlers)
+	m.handlerMu.RUnlock()
+	
+	for _, handler := range handlers {
+		// Run in goroutine to avoid blocking
+		go func(h MessageHandler) {
+			defer func() {
+				if r := recover(); r != nil {
+					m.ClientLogger.Errorf("message handler panic: %v", r)
+				}
+			}()
+			h(accountID, evt)
+		}(handler)
+	}
 }

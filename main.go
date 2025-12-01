@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 
+	"promote/internal/autojoin"
 	httpapi "promote/internal/http"
 	"promote/internal/scheduler"
 	"promote/internal/sender"
@@ -31,12 +32,17 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Inisialisasi auto-join handler
+	autoJoiner := autojoin.New(store, manager)
+	manager.AddMessageHandler(autoJoiner.HandleMessage)
+	log.Println("Auto-join handler registered")
+
 	// Inisialisasi pengirim dan scheduler anti-spam (aktif otomatis dengan jendela aman WIB).
 	snd := sender.New(store, manager)
 	sched := scheduler.New(store, manager, snd)
 	sched.Start(ctx)
 
-	router := httpapi.NewRouter(store, manager)
+	router := httpapi.NewRouter(store, manager, autoJoiner)
 
 	port := os.Getenv("PORT")
 	if port == "" {

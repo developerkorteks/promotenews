@@ -25,18 +25,24 @@ import (
 )
 
 type API struct {
-	Store   *storage.Store
-	Manager *wa.Manager
-	Sender  *sender.Sender
-	Router  *chi.Mux
+	Store      *storage.Store
+	Manager    *wa.Manager
+	Sender     *sender.Sender
+	AutoJoiner interface {
+		ProcessInviteCode(ctx context.Context, accountID, inviteCode, sharedBy, sharedIn string)
+	}
+	Router *chi.Mux
 }
 
-func NewRouter(store *storage.Store, manager *wa.Manager) *chi.Mux {
+func NewRouter(store *storage.Store, manager *wa.Manager, autoJoiner interface {
+	ProcessInviteCode(ctx context.Context, accountID, inviteCode, sharedBy, sharedIn string)
+}) *chi.Mux {
 	api := &API{
-		Store:   store,
-		Manager: manager,
-		Sender:  sender.New(store, manager),
-		Router:  chi.NewRouter(),
+		Store:      store,
+		Manager:    manager,
+		Sender:     sender.New(store, manager),
+		AutoJoiner: autoJoiner,
+		Router:     chi.NewRouter(),
 	}
 	r := api.Router
 	r.Use(middleware.RequestID)
@@ -99,6 +105,13 @@ func (a *API) routes() {
 
 	// Force one-off scheduler send (ignore safe window) for diagnostics
 	a.Router.Post("/api/scheduler/trigger", a.handleSchedulerTrigger)
+
+	// Auto-join management
+	a.Router.Get("/api/accounts/{id}/autojoin/settings", a.handleGetAutoJoinSettings)
+	a.Router.Put("/api/accounts/{id}/autojoin/settings", a.handleUpdateAutoJoinSettings)
+	a.Router.Post("/api/accounts/{id}/autojoin/enable", a.handleToggleAutoJoin)
+	a.Router.Get("/api/accounts/{id}/autojoin/logs", a.handleGetAutoJoinLogs)
+	a.Router.Post("/api/autojoin/manual", a.handleManualJoin)
 
 	// Log streaming (SSE)
 	a.Router.Get("/api/logs/stream", a.handleLogsStream)
@@ -1133,7 +1146,7 @@ small.mono{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
 <section id="accounts">
   <h3>Daftar Akun</h3>
   <table>
-    <thead><tr><th>Label</th><th>MSISDN</th><th>Status</th><th>Limit</th><th>Aksi</th></tr></thead>
+    <thead><tr><th>Label</th><th>MSISDN</th><th>Status</th><th>Limit</th><th>Auto-Join</th><th>Aksi</th></tr></thead>
     <tbody id="accounts-tbody"></tbody>
   </table>
   <div class="row" style="margin-top:8px">
@@ -1159,6 +1172,8 @@ small.mono{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
   <div class="row">
     <select id="groups-account"></select>
     <button id="btn-refresh" class="secondary">Refresh dari WhatsApp</button>
+    <button onclick="enableAllGroups()" class="secondary" style="margin-left:1rem;">✓ Enable All</button>
+    <button onclick="disableAllGroups()" class="secondary" style="margin-left:0.5rem;">✗ Disable All</button>
   </div>
   <table style="margin-top:8px">
     <thead><tr><th>Nama Grup</th><th>Enabled</th><th>Terakhir Kirim</th><th>Risk</th><th>ID</th><th>Aksi</th></tr></thead>
@@ -1379,11 +1394,18 @@ async function pollHealth(){
 
 function rowAccount(a){
   var tr = document.createElement('tr');
+  var autoJoinId = 'autojoin-' + a.id;
   tr.innerHTML =
     '<td>'+escapeHtml(a.label)+'</td>'+
     '<td>'+(a.msisdn?escapeHtml(a.msisdn):'-')+'</td>'+
     '<td><span class="'+(a.status==='online'?'ok':'err')+'">'+escapeHtml(a.status)+'</span></td>'+
     '<td>'+a.daily_limit+'</td>'+
+    '<td>'+
+      '<label style="display:flex;align-items:center;gap:5px;cursor:pointer;">'+
+        '<input type="checkbox" id="'+autoJoinId+'" data-account-id="'+a.id+'" class="autojoin-toggle" style="cursor:pointer;"> '+
+        '<span id="'+autoJoinId+'-label" style="font-size:12px;">...</span>'+
+      '</label>'+
+    '</td>'+
     '<td>'+
       '<button data-act="qr" data-id="'+a.id+'">QR</button> '+
       '<button data-act="connect" data-id="'+a.id+'" class="secondary">Connect</button> '+
@@ -1392,6 +1414,12 @@ function rowAccount(a){
       '<button data-act="edit" data-id="'+a.id+'">Edit</button> '+
       '<button data-act="delete" data-id="'+a.id+'" class="danger">Delete</button>'+
     '</td>';
+  
+  // Load auto-join status after row is added to DOM
+  setTimeout(function(){
+    loadAutoJoinStatus(a.id);
+  }, 100);
+  
   return tr;
 }
 
@@ -1549,6 +1577,124 @@ async function loadGroups(){
 async function toggleGroup(id, enabled){
   var r = await api('/api/groups/toggle',{method:'POST',body:JSON.stringify({group_id:id,enabled:enabled})});
   if(!r.ok){ var t=await r.text(); alert('Toggle gagal: '+t); }
+}
+
+// Bulk enable all groups (optimized with single API call)
+async function enableAllGroups(){
+  var accountId = $('#groups-account').value;
+  if(!accountId){ 
+    alert('Pilih akun terlebih dahulu'); 
+    return; 
+  }
+  
+  if(!confirm('Enable semua grup untuk promosi?')){
+    return;
+  }
+  
+  try {
+    var r = await api('/api/accounts/'+encodeURIComponent(accountId)+'/groups/enable_all', {method:'POST'});
+    if(!r.ok){
+      var t = await r.text();
+      alert('Gagal enable all: '+t);
+      return;
+    }
+    var result = await r.json();
+    alert('Berhasil enable '+result.updated+' grup');
+    await loadGroups();
+  } catch(e) {
+    alert('Error: '+e.message);
+  }
+}
+
+// Bulk disable all groups (using loop for now, can be optimized with API endpoint later)
+async function disableAllGroups(){
+  var accountId = $('#groups-account').value;
+  if(!accountId){ 
+    alert('Pilih akun terlebih dahulu'); 
+    return; 
+  }
+  
+  if(!confirm('Disable semua grup?')){
+    return;
+  }
+  
+  try {
+    var r = await api('/api/groups?account_id='+encodeURIComponent(accountId));
+    var list = await r.json();
+    
+    var count = 0;
+    for(var i=0; i<list.length; i++){
+      var g = list[i];
+      if(g.enabled){
+        await toggleGroup(g.id, false);
+        count++;
+        // Small delay to avoid overwhelming the server
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    }
+    
+    alert('Berhasil disable '+count+' grup');
+    await loadGroups();
+  } catch(e) {
+    alert('Error: '+e.message);
+  }
+}
+
+// Auto-join functions
+async function loadAutoJoinStatus(accountId){
+  try {
+    var r = await api('/api/accounts/'+encodeURIComponent(accountId)+'/autojoin/settings');
+    if(!r.ok) {
+      updateAutoJoinUI(accountId, false, 'error');
+      return;
+    }
+    var data = await r.json();
+    updateAutoJoinUI(accountId, data.enabled, 'loaded');
+  } catch(e) {
+    console.error('Failed to load auto-join status:', e);
+    updateAutoJoinUI(accountId, false, 'error');
+  }
+}
+
+function updateAutoJoinUI(accountId, enabled, state){
+  var checkbox = $('#autojoin-'+accountId);
+  var label = $('#autojoin-'+accountId+'-label');
+  if(!checkbox || !label) return;
+  
+  checkbox.checked = enabled;
+  checkbox.disabled = state === 'loading';
+  
+  if(state === 'loading'){
+    label.textContent = '...';
+    label.style.color = '#9aa0aa';
+  } else if(state === 'error'){
+    label.textContent = 'N/A';
+    label.style.color = '#ff6b6b';
+  } else {
+    label.textContent = enabled ? 'ON' : 'OFF';
+    label.style.color = enabled ? '#7bd88f' : '#9aa0aa';
+  }
+}
+
+async function toggleAutoJoin(accountId, enabled){
+  updateAutoJoinUI(accountId, enabled, 'loading');
+  try {
+    var r = await api('/api/accounts/'+encodeURIComponent(accountId)+'/autojoin/enable', {
+      method: 'POST',
+      body: JSON.stringify({enabled: enabled})
+    });
+    if(!r.ok){
+      var t = await r.text();
+      alert('Gagal toggle auto-join: '+t);
+      await loadAutoJoinStatus(accountId);
+      return;
+    }
+    updateAutoJoinUI(accountId, enabled, 'loaded');
+  } catch(e) {
+    console.error('Failed to toggle auto-join:', e);
+    alert('Error: '+e.message);
+    await loadAutoJoinStatus(accountId);
+  }
 }
 
 function renderParticipants(list){
@@ -1890,6 +2036,13 @@ function bindEvents(){
   $('#groups-tbody').addEventListener('change', function(e){
     var cb = e.target.closest('.g-toggle'); if(!cb) return;
     toggleGroup(cb.getAttribute('data-id'), cb.checked);
+  });
+
+  // Auto-join toggle event listener
+  $('#accounts-tbody').addEventListener('change', function(e){
+    if(e.target.classList.contains('autojoin-toggle')){
+      toggleAutoJoin(e.target.getAttribute('data-account-id'), e.target.checked);
+    }
   });
   
   // Fix groups-tbody click handler with debug

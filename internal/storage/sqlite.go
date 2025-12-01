@@ -169,6 +169,35 @@ func migrate(db *sql.DB) error {
 		docs_caption = CASE WHEN docs_json IS NOT NULL AND docs_json != '[]' THEN text ELSE NULL END
 		WHERE text_only IS NULL`)
 	
+	// Auto-join settings table
+	_, _ = tx.Exec(`CREATE TABLE IF NOT EXISTS auto_join_settings (
+		account_id TEXT PRIMARY KEY,
+		enabled INTEGER NOT NULL DEFAULT 0,
+		daily_limit INTEGER NOT NULL DEFAULT 20,
+		preview_before_join INTEGER NOT NULL DEFAULT 1,
+		whitelist_contacts TEXT,
+		blacklist_keywords TEXT,
+		FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+	)`)
+	
+	// Auto-join logs table for audit trail
+	_, _ = tx.Exec(`CREATE TABLE IF NOT EXISTS auto_join_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		account_id TEXT NOT NULL,
+		group_id TEXT,
+		group_name TEXT,
+		invite_code TEXT NOT NULL,
+		shared_by TEXT,
+		shared_in TEXT,
+		status TEXT NOT NULL,
+		reason TEXT,
+		joined_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+	)`)
+	_, _ = tx.Exec(`CREATE INDEX IF NOT EXISTS idx_auto_join_logs_account ON auto_join_logs(account_id);`)
+	_, _ = tx.Exec(`CREATE INDEX IF NOT EXISTS idx_auto_join_logs_status ON auto_join_logs(account_id, status, joined_at);`)
+	_, _ = tx.Exec(`CREATE INDEX IF NOT EXISTS idx_auto_join_logs_code ON auto_join_logs(account_id, invite_code);`)
+	
 	// Remove old text column after migration (optional, commented for safety)
 	// _, _ = tx.Exec(`ALTER TABLE templates DROP COLUMN text;`)
 	return tx.Commit()
